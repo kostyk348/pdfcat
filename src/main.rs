@@ -1,0 +1,35 @@
+//! pdfcat — организатор каталогов PDF на сетевом диске.
+//! Скелет (MVP): scan/index/search/stats. UI Bento — этап E5 (см. pdfcat-solution.md).
+
+mod arena;
+mod bm25;
+mod cli;
+mod domain;
+mod index_store;
+mod inflate;
+mod pdf;
+mod ports;
+mod scan;
+mod store;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let code = match args.get(1).map(|s| s.as_str()) {
+        Some("scan") if args.len() >= 3 => {
+            let depth = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
+            cli::cmd_scan(&args[2], depth)
+        }
+        Some("index") => cli::cmd_index(args.get(2).and_then(|s| s.parse().ok())),
+        Some("search") if args.len() >= 3 => {
+            let limit = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+            cli::cmd_search(&args[2], limit)
+        }
+        Some("stats") => cli::cmd_stats(),
+        Some("peek") if args.len() >= 3 => cli::cmd_peek(args[2].parse().unwrap_or(0)),
+        _ => {
+            cli::help();
+            0
+        }
+    };
+    std::process::exit(code);
+}
