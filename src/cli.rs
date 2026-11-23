@@ -9,8 +9,13 @@ use crate::scan::FsScanner;
 use crate::ports::Source;
 use std::time::Instant;
 
-pub const DEFAULT_DB: &str = "catalog.pdfcat";
-pub const DEFAULT_INDEX: &str = "index.pdfcat";
+pub fn default_db() -> String {
+    crate::win::db_dir().join("catalog.pdfcat").to_string_lossy().into_owned()
+}
+pub fn default_index() -> String {
+    crate::win::db_dir().join("index.pdfcat").to_string_lossy().into_owned()
+}
+const DEFAULT_DB: &str = "catalog.pdfcat";
 const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn cmd_scan(root: &str, max_depth: u32) -> i32 {
@@ -21,7 +26,7 @@ pub fn cmd_scan(root: &str, max_depth: u32) -> i32 {
         eprintln!("инвариант каталога нарушен после скана");
         return 2;
     }
-    if let Err(e) = cat.save(DEFAULT_DB) {
+    if let Err(e) = cat.save(&default_db()) {
         eprintln!("сохранение: {e}");
         return 1;
     }
@@ -33,7 +38,7 @@ pub fn cmd_scan(root: &str, max_depth: u32) -> i32 {
 }
 
 pub fn cmd_index(limit: Option<u32>) -> i32 {
-    let mut cat = match Catalog::load(DEFAULT_DB) {
+    let mut cat = match Catalog::load(&default_db()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("нет каталога ({e}); сначала scan");
@@ -70,16 +75,16 @@ pub fn cmd_index(limit: Option<u32>) -> i32 {
         "проиндексировано {done} (ошибок {failed}) · терминов {terms} · токенов {tokens} · {} мс",
         t0.elapsed().as_millis()
     );
-    if let Err(e) = idx.save(DEFAULT_INDEX) {
+    if let Err(e) = idx.save(&default_index()) {
         eprintln!("сохранение индекса: {e}");
         return 1;
     }
-    println!("индекс → {DEFAULT_INDEX}");
+    println!("индекс → {}", default_index());
     0
 }
 
 pub fn cmd_search(query: &str, limit: usize) -> i32 {
-    let cat = match Catalog::load(DEFAULT_DB) {
+    let cat = match Catalog::load(&default_db()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("нет каталога ({e}); сначала scan");
@@ -87,7 +92,7 @@ pub fn cmd_search(query: &str, limit: usize) -> i32 {
         }
     };
     // Текстовый BM25, если индекс построен
-    if let Ok(idx) = Bm25::load(DEFAULT_INDEX) {
+    if let Ok(idx) = Bm25::load(&default_index()) {
         let t0 = std::time::Instant::now();
         let hits = idx.search(query, limit);
         let ms = t0.elapsed().as_micros();
@@ -117,7 +122,7 @@ pub fn cmd_search(query: &str, limit: usize) -> i32 {
 }
 
 pub fn cmd_peek(n: u32) -> i32 {
-    let cat = match Catalog::load(DEFAULT_DB) {
+    let cat = match Catalog::load(&default_db()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("нет каталога ({e})");
@@ -155,7 +160,7 @@ pub fn cmd_peek(n: u32) -> i32 {
 }
 
 pub fn cmd_stats() -> i32 {
-    match Catalog::load(DEFAULT_DB) {
+    match Catalog::load(&default_db()) {
         Ok(c) => {
             println!(
                 "каталогов {} · записей {} · корень: {}",
