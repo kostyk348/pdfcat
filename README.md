@@ -56,7 +56,7 @@ Hexagonal: порты `Source / TextExtractor / Searcher / CatalogStore`; дом
 
 E1 — окно Bento Grids на GDI (плитки 232×160…712×328, сетка 8 px, палитра #0F1115/#6EE7F9);
 E2 — PDF 1.5 (xref/object streams), `/Differences`, LZW; E3 — наблюдение за изменениями;
-E4 — параллельная индексация + mmap-индекс; E5 — сниппеты и граф-вид; E6 — OCR как опция.
+E4 — параллельная индексация + mmap-индекс; E5 — сниппеты; E6 — сжатие индекса. БД хранится рядом с exe (fallback %LOCALAPPDATA%\pdfcat).
 
 ---
 
