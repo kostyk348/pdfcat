@@ -184,6 +184,17 @@ extern "system" {
     pub fn GetTextExtentPoint32W(hdc: HDC, s: *const u16, c: i32, size: *mut Point) -> i32;
     pub fn BitBlt(dst: HDC, dx: i32, dy: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32) -> i32;
     pub fn CreateSolidBrush(color: u32) -> HBRUSH;
+    pub fn CreatePen(style: i32, width: i32, color: u32) -> HGDIOBJ;
+    pub fn MoveToEx(hdc: HDC, x: i32, y: i32, old: *mut Point) -> i32;
+    pub fn LineTo(hdc: HDC, x: i32, y: i32) -> i32;
+    pub fn Polygon(hdc: HDC, pts: *const Point, n: i32) -> i32;
+    pub fn Rectangle(hdc: HDC, l: i32, t: i32, r: i32, b: i32) -> i32;
+    pub fn SetTextAlign(hdc: HDC, mode: u32) -> u32;
+    pub fn GetStockObject(obj: i32) -> HGDIOBJ;
+    pub fn CreateRectRgn(l: i32, t: i32, r: i32, b: i32) -> HGDIOBJ;
+    pub fn SelectClipRgn(hdc: HDC, rgn: HGDIOBJ) -> i32;
+    pub fn SaveDC(hdc: HDC) -> i32;
+    pub fn RestoreDC(hdc: HDC, saved: i32) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -203,6 +214,12 @@ extern "system" {
 }
 
 pub const SRCCOPY: u32 = 0x00CC_0020;
+pub const PS_SOLID: i32 = 0;
+pub const PS_NULL: i32 = 5;
+pub const NULL_BRUSH: i32 = 5;
+pub const NULL_PEN: i32 = 8;
+pub const TA_BASELINE: u32 = 24;
+pub const TA_LEFT: u32 = 0;
 pub const TRANSPARENT_BK: i32 = 1;
 pub const DEFAULT_CHARSET: u32 = 1;
 pub const CLEARTYPE_QUALITY: u32 = 5;

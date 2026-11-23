@@ -68,6 +68,13 @@ pub struct UiState {
     pub results: Vec<(u32, f64)>,
     pub selected: Option<u32>,
     pub preview: Option<(u32, String)>,
+    pub pv: Option<crate::render_pdf::PdfRender>,
+    pub pv_page: usize,
+    pub pv_zoom: f64,
+    pub pv_offx: f64,
+    pub pv_offy: f64,
+    pub pv_btn_prev: (i32, i32, i32, i32),
+    pub pv_btn_next: (i32, i32, i32, i32),
     pub catalog: Catalog,
     pub index_loaded: bool,
     pub db: PathBuf,
@@ -109,6 +116,13 @@ impl UiState {
             results: Vec::new(),
             selected: None,
             preview: None,
+            pv: None,
+            pv_page: 0,
+            pv_zoom: 0.0,
+            pv_offx: 0.0,
+            pv_offy: 0.0,
+            pv_btn_prev: (0, 0, 0, 0),
+            pv_btn_next: (0, 0, 0, 0),
             catalog: Catalog::load(cat_path.to_str().unwrap_or("catalog.pdfcat")).unwrap_or_default(),
             index_loaded: idx_path.exists(),
             db: db.to_path_buf(),
@@ -259,6 +273,24 @@ pub fn on_click(c: &mut Ctx, x: i32, y: i32) {
         }
         return;
     }
+    let (px, py, pw, ph) = ui.r_preview;
+    if x >= px && x < px + pw && y >= py && y < py + ph {
+        let (ax, ay, aw, ah) = ui.pv_btn_prev;
+        if x >= ax && x < ax + aw && y >= ay && y < ay + ah {
+            if let Some(pv) = ui.pv.as_mut() {
+                pv.page_step(-1);
+            }
+            return;
+        }
+        let (nx, ny, nw, nh) = ui.pv_btn_next;
+        if x >= nx && x < nx + nw && y >= ny && y < ny + nh {
+            if let Some(pv) = ui.pv.as_mut() {
+                pv.page_step(1);
+            }
+            return;
+        }
+        ui.focus = Focus::None;
+    }
     ui.focus = Focus::None;
 }
 
@@ -300,7 +332,12 @@ pub fn on_wheel(c: &mut Ctx, x: i32, y: i32, delta: i32) {
         return;
     }
     let (rx, ry, _rw, _rh) = ui.r_results;
-    if x >= rx && y >= ry && y < ui.r_preview.1 {
+    if x >= rx && y >= ry {
+        if y >= ui.r_preview.1 && ui.pv.is_some() {
+            // колесо над канвасом — прокрутка страницы
+            ui.pv.as_mut().unwrap().scroll(delta as f64 * 80.0);
+            return;
+        }
         ui.scroll_results = (ui.scroll_results - delta * 44).max(0);
     }
 }
@@ -338,6 +375,11 @@ pub fn on_key(c: &mut Ctx, vk: WPARAM) {
     match vk {
         VK_RETURN if ui.focus == Focus::Search => run_search(ui),
         VK_BACK | VK_DELETE if ui.focus != Focus::Search => {}
+        VK_PRIOR | VK_NEXT => {
+            if let Some(pv) = ui.pv.as_mut() {
+                pv.page_step(if vk == VK_NEXT { 1 } else { -1 });
+            }
+        }
         VK_UP | VK_DOWN if ui.focus != Focus::Search => {
             let list_len = if ui.mode == Mode::Tree { ui.tree.len() } else { ui.results.len() };
             if list_len == 0 {
@@ -367,7 +409,7 @@ pub fn on_key(c: &mut Ctx, vk: WPARAM) {
 
 // ---------------------------------------------------------------- действия
 
-fn run_search(ui: &mut UiState) {
+pub fn run_search(ui: &mut UiState) {
     let q = ui.query.clone();
     if q.trim().is_empty() {
         return;
@@ -407,21 +449,26 @@ fn show_dir_files(ui: &mut UiState, dir_id: u32) {
     ui.set_status(&format!("каталог «{}»: {} PDF", name, ui.results.len()));
 }
 
-fn load_preview(ui: &mut UiState, doc_id: u32) {
-    if ui.preview.as_ref().map(|(d, _)| *d) == Some(doc_id) {
+pub(crate) fn load_preview(ui: &mut UiState, doc_id: u32) {
+    if ui.selected == Some(doc_id) && ui.pv.is_some() {
         return;
     }
     let path = ui.catalog.entry_path(doc_id).to_string();
-    let ex = PdfExtractor;
-    ui.preview = match ex.extract(&path, 64 * 1024 * 1024) {
-        Ok(x) => {
-            let mut text = x.pages.join("\n");
-            text.truncate(6000);
-            Some((doc_id, text))
+    match crate::render_pdf::PdfRender::open(&path) {
+        Ok(r) => {
+            ui.pv = Some(r);
+            ui.pv_page = 0;
+            ui.pv_zoom = 0.0; // по ширине
+            ui.pv_offx = 0.0;
+            ui.pv_offy = 0.0;
+            ui.selected = Some(doc_id);
         }
-        Err(_) => Some((doc_id, String::new())),
-    };
-    ui.scroll_preview = 0;
+        Err(e) => {
+            ui.pv = None;
+            ui.selected = Some(doc_id);
+            ui.set_status(&format!("превью недоступно: {e:?}"));
+        }
+    }
 }
 
 pub fn do_scan(hwnd: HWND, ui: &mut UiState) {
@@ -664,36 +711,66 @@ pub fn draw_frame(ctx: &mut Ctx) {
         let _ = cy2;
     }
 
-    // ---- Превью
+    // ---- Превью: рендер страницы PDF
     tile(ctx, &r_preview);
     ctx.ui.r_preview = r_preview.xywh();
     {
         let (x, y, wid, hei) = r_preview.xywh();
-        let mut cy = y + 34;
-        match &ctx.ui.preview {
-            Some((doc, txt)) => {
-                let name = ctx.ui.catalog.entry_name(*doc).to_string();
-                text(ctx, x + 14, cy, &name, 15, FW_SEMIBOLD, ACCENT);
-                cy += 28;
-                let max_w = wid - 28;
-                for line in txt.split('\n') {
-                    for chunk in wrap(line, max_w, 13) {
-                        if cy > y + hei - 22 {
-                            break;
-                        }
-                        text(ctx, x + 14, cy, &chunk, 13, FW_NORMAL, TEXT);
-                        cy += 19;
-                    }
-                    cy += 4;
-                    if cy > y + hei - 22 {
-                        break;
-                    }
+        let pv_page = ctx.ui.pv_page;
+        let pv_zoom = ctx.ui.pv_zoom;
+        let pv_offx = ctx.ui.pv_offx;
+        let pv_offy = ctx.ui.pv_offy;
+        let pv_page_count = ctx.ui.pv.as_ref().map(|p| p.pages()).unwrap_or(0);
+        // Кнопки навигации (до заёма pv)
+        let by = y + 30;
+        let btn = |bx: i32| (bx, by, 32, 26);
+        let b_prev = btn(x + wid - 150);
+        let b_next = btn(x + wid - 110);
+        ctx.ui.pv_btn_prev = b_prev;
+        ctx.ui.pv_btn_next = b_next;
+        fill(ctx, b_prev.0, b_prev.1, b_prev.2, b_prev.3, TILE);
+        fill(ctx, b_next.0, b_next.1, b_next.2, b_next.3, TILE);
+        text(ctx, b_prev.0 + 11, b_prev.1 + 4, "◀", 15, FW_SEMIBOLD, TEXT);
+        text(ctx, b_next.0 + 11, b_next.1 + 4, "▶", 15, FW_SEMIBOLD, TEXT);
+        let page_lbl = format!("{}/{}", ctx.ui.pv_page + 1, ctx.ui.pv.as_ref().map(|p| p.pages()).unwrap_or(0));
+        text(ctx, x + wid - 96, by + 5, &page_lbl, 15, FW_SEMIBOLD, MUTED);
+        let pv_offx = ctx.ui.pv_offx;
+        let mut pv_offy = ctx.ui.pv_offy;
+        let pv_zoom = ctx.ui.pv_zoom;
+        let pv_page = ctx.ui.pv_page;
+        let mut pv = ctx.ui.pv.take();
+        match pv.as_mut() {
+            None => {
+                text(ctx, x + 14, y + 34, "выберите PDF в «Каталоге» или «Результатах»", 13, FW_NORMAL, MUTED);
+            }
+            Some(pv) => {
+                // Канвас
+                let cx = x + 8;
+                let cy = y + 62;
+                let cw = wid - 16;
+                let ch = hei - 72;
+                fill(ctx, cx, cy, cw, ch, 0x3A3F4B);
+                let (ptw, pth) = pv.media_pt(pv_page);
+                let zoom = if pv_zoom > 0.0 { pv_zoom } else { (cw as f64 - 16.0) / ptw };
+                unsafe {
+                    let rgn = CreateRectRgn(cx, cy, cx + cw, cy + ch);
+                    SelectClipRgn(ctx.mem_dc, rgn);
+                    DeleteObject(rgn);
+                }
+                pv.render_page_into(ctx.mem_dc, (cx, cy, cw, ch), pv_page, zoom, pv_offx, pv_offy);
+                unsafe {
+                    SelectClipRgn(ctx.mem_dc, 0);
+                }
+                let content_h = pth * zoom;
+                if content_h > ch as f64 {
+                    pv_offy = pv_offy.clamp(0.0, content_h - ch as f64);
+                } else {
+                    pv_offy = 0.0;
                 }
             }
-            None => {
-                text(ctx, x + 14, cy, "выберите PDF в «Каталоге» или «Результатах»", 13, FW_NORMAL, MUTED);
-            }
         }
+        ctx.ui.pv = pv;
+        ctx.ui.pv_offy = pv_offy;
     }
 
     // ---- Статусная строка

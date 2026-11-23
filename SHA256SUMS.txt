@@ -1,2 +1,2 @@
-37a0659e13eb44d42cb158112e300250427e3663bf0283def36af4bc20936367 *target/x86_64-pc-windows-gnu/release/pdfcat-0.2.0-win7-x64.exe
-2dbe0a1ac175967d17ab0a9ccdcdd7e12377fddfb9b2fe8cbef2ee5769a351f8 *target/release/pdfcat-0.2.0-win64.exe
+ac4de01c259527ddb46d6b555dd18db097af2aba900093e0ed35f05c4e0c1ecd *target/x86_64-pc-windows-gnu/release/pdfcat-0.3.0-win7-x64.exe
+bec7c88a363f6c7d1e839a005619ea7b4d7ff3beec542afeb2e57d69c5dbbcfa *target/release/pdfcat-0.3.0-win64.exe

@@ -9,6 +9,7 @@ mod index_store;
 mod inflate;
 mod pdf;
 mod ports;
+mod render_pdf;
 mod scan;
 mod store;
 mod ui;
@@ -27,6 +28,11 @@ fn main() {
             let mut ui = ui::UiState::load_or_empty(&db);
             if std::env::var("PDFCAT_MODE").as_deref() == Ok("graph") {
                 ui.mode = ui::Mode::Graph;
+            }
+            if let Ok(n) = std::env::var("PDFCAT_SELECT") {
+                if let Ok(id) = n.parse::<u32>() {
+                    ui::load_preview(&mut ui, id);
+                }
             }
             let ok = win::render_to_bmp(w, h, ui, &out);
             println!("{}", if ok { format!("снимок → {out}") } else { "ошибка записи bmp".into() });

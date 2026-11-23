@@ -1,24 +1,19 @@
-# pdfcat v0.2.0 — окно Bento Grids
+# pdfcat v0.3.0 — визуальный превью PDF с пролистыванием
 
 ## Русский
-**Первый релиз с GUI.** Запуск без аргументов открывает окно Bento на GDI (тёмная тема, сетка 8 px):
-- плитки: «Каталог» (**дерево и граф** — оба режима), «Результаты поиска» с вводом и каретой,
-  «Статистика», «Превью текста»;
-- «Сканировать…» → выбор папки → скан + BM25-индексация; **сетевой диск не изменяется ни на байт**;
-- двойной клик по PDF — открыть в просмотрщике (тоже только чтение);
-- БД рядом с exe (портативно), при отказе прав — %LOCALAPPDATA%\pdfcat;
-- OCR не существует по решению владельца.
+Превью в окне теперь показывает **саму страницу PDF** (свой растеризатор: текст с позициями
+и поворотами, линии, прямоугольники, цвета; клип по MediaBox). Навигация: ◀ ▶ по страницам,
+колесо — прокрутка листа, масштаб по ширине плитки. Плюс всё из v0.2.0: окно Bento,
+дерево и граф, BM25-поиск с кириллицей, БД рядом с exe, диск только читается.
 
-CLI-команды прежние: scan / index / search / stats / peek / snapshot.
-Win7: `pdfcat-0.2.0-win7-x64.exe` (KB2999226 нужен на целевой машине), 595 КБ.
-Тесты 17/17. Прочие ассеты: `pdfcat-0.2.0-win64.exe`, SHA256SUMS.txt.
+Честные ограничения рендера: без картинок (DCT/CCITT), шейдингов, клип-путей и встроенных
+шрифтов (замена системным Segoe UI). Тесты 18/18. Win7: `pdfcat-0.3.0-win7-x64.exe` (595 КБ).
 
 ## English
-**First GUI release.** Running without arguments opens the Bento window on GDI (dark theme, 8px grid):
-Catalog tile with **both tree and graph modes**, Results tile with search input and caret,
-Stats, Text preview. "Scan…" → folder picker → scan + BM25 index; **the scanned drive is never
-written to**. Double-click opens the PDF read-only. DB stored next to the exe (portable), with a
-%LOCALAPPDATA%\pdfcat fallback. No OCR, by owner decision (scans are matched by name only).
+The preview tile now renders **the actual PDF page** (own content-stream rasterizer: positioned
+text with 90° rotations, lines, rectangles, colors; MediaBox clipping). Navigation: ◀ ▶ pages,
+wheel to scroll, fit-width by default. Plus everything from v0.2.0: Bento window, tree and graph
+views, Cyrillic BM25 search, DB next to the exe, read-only drive.
 
-CLI unchanged: scan / index / search / stats / peek / snapshot.
-Win7 asset: `pdfcat-0.2.0-win7-x64.exe` (requires KB2999226 on the target), 595 KB. Tests 17/17.
+Honest renderer limits: no images (DCT/CCITT), no shadings, no clip paths, no embedded fonts
+(substituted with system Segoe UI). Tests 18/18. Win7: `pdfcat-0.3.0-win7-x64.exe` (595 KB).

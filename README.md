@@ -7,7 +7,7 @@
 
 [English below](#english)
 
-## Окно Bento (v0.2.0)
+## Окно Bento + визуальный превью PDF (v0.3.0)
 
 Запуск **без аргументов** открывает окно Bento Grids на GDI (тёмная тема, сетка 8 px):
 - плитки: «Каталог» (дерево **и** граф — оба режима), «Результаты поиска» с полем ввода и каретой,
@@ -42,7 +42,7 @@
 Поддержано: классический xref (+fallback-скан «N G obj»), `/FlateDecode` (свой inflate), literal/hex
 строки, WinAnsi/PDFDocEncoding, **Type0/Identity-H через `/ToUnicode` (bfchar/bfrange) — кириллица
 Word-экспортов**, `/Length` (в т.ч. косвенная).
-Пропускается с причиной: xref/object streams (PDF 1.5+), `/Differences`, LZW/RunLength, шифрованные
+Пропускается с причиной: xref/object streams (PDF 1.5+), `/Differences`, LZW/RunLength, шифрованные PDF. Рендер превью: без картинок (DCT), шейдингов и клип-путей — текст и векторные примитивы.
 PDF, сканы без текстового слоя (OCR — этап E6).
 
 ## Запуск

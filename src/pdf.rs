@@ -24,7 +24,7 @@ const MAX_CMAP: usize = 16 * 1024 * 1024;
 // ---------------------------------------------------------------- Values
 
 #[derive(Debug, Clone)]
-enum Value {
+pub(crate) enum Value {
     Num(f64),
     Ref(u32, u32),
     Name(Vec<u8>),
@@ -511,7 +511,7 @@ impl PdfDoc {
         }
     }
 
-    fn resolve_ref(&self, v: &Value) -> Option<u32> {
+    pub(crate) fn resolve_ref(&self, v: &Value) -> Option<u32> {
         if let Value::Ref(n, _) = v {
             Some(*n)
         } else {
@@ -520,7 +520,7 @@ impl PdfDoc {
     }
 
     /// Классический xref / trailer → objnum /Root; fallback: скан b"/Catalog".
-    fn root_obj(&mut self) -> Result<u32, ExtractError> {
+    pub(crate) fn root_obj(&mut self) -> Result<u32, ExtractError> {
         let tail_start = self.data.len().saturating_sub(4096);
         let tail = &self.data[tail_start..];
         if let Some(x) = rfind(tail, b"startxref") {
@@ -778,9 +778,9 @@ fn utf16be_to_string(bytes: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------- Извлечение текста
 
 #[derive(Clone)]
-struct FontMap {
-    two_byte: bool,
-    cmap: ToUnicode,
+pub(crate) struct FontMap {
+    pub two_byte: bool,
+    pub cmap: ToUnicode,
 }
 
 
@@ -864,47 +864,7 @@ impl TextExtractor for PdfExtractor {
         let mut out = Extracted::default();
         for &p in &pages {
             let Some(d) = doc.obj_dict(p) else { continue };
-            // Ресурсы → шрифты
-            let mut fonts: HashMap<Vec<u8>, FontMap> = HashMap::new();
-            if let Some(res) = d.get(&b"Resources".to_vec()) {
-                let res_dict = match res {
-                    Value::Dict(_) => Some(res.clone()),
-                    Value::Ref(n, _) => doc.obj_dict(*n).map(Value::Dict),
-                    _ => None,
-                };
-                if let Some(Value::Dict(rd)) = res_dict {
-                    if let Some(fv) = rd.get(&b"Font".to_vec()) {
-                        let font_dict = match fv {
-                            Value::Dict(_) => Some(fv.clone()),
-                            Value::Ref(n, _) => doc.obj_dict(*n).map(Value::Dict),
-                            _ => None,
-                        };
-                        if let Some(Value::Dict(fd)) = font_dict {
-                            for (name, fval) in &fd {
-                                let fnum = match fval {
-                                    Value::Ref(n, _) => Some(*n),
-                                    _ => None,
-                                };
-                                let Some(fnum) = fnum else { continue };
-                                let Some(fdict) = doc.obj_dict(fnum) else { continue };
-                                let subtype = match fdict.get(&b"Subtype".to_vec()) {
-                                    Some(Value::Name(n)) => n.clone(),
-                                    _ => Vec::new(),
-                                };
-                                let mut fm = FontMap { two_byte: subtype == b"Type0", cmap: ToUnicode::default() };
-                                if let Some(tu) = fdict.get(&b"ToUnicode".to_vec()).and_then(|v| doc.resolve_ref(v)) {
-                                    if let Some(cmap_src) = doc.stream_of(tu)? {
-                                        if cmap_src.len() <= MAX_CMAP {
-                                            fm.cmap = parse_cmap(&cmap_src);
-                                        }
-                                    }
-                                }
-                                fonts.insert(name.clone(), fm);
-                            }
-                        }
-                    }
-                }
-            }
+            let fonts = page_fonts(&doc, p);
             // Контент: один поток или массив
             let mut content: Vec<u8> = Vec::new();
             match d.get(&b"Contents".to_vec()) {
@@ -927,6 +887,54 @@ impl TextExtractor for PdfExtractor {
         }
         Ok(out)
     }
+}
+
+pub(crate) fn decode_string_with_font(raw: &[u8], f: Option<&FontMap>) -> String {
+    decode_bytes(raw, f)
+}
+
+/// Шрифты страницы: имя -> карта кодирования (ToUnicode/WinAnsi).
+pub(crate) fn page_fonts(doc: &PdfDoc, page_obj: u32) -> HashMap<Vec<u8>, FontMap> {
+    let mut fonts: HashMap<Vec<u8>, FontMap> = HashMap::new();
+    let Some(d) = doc.obj_dict(page_obj) else { return fonts };
+    let Some(res) = d.get(&b"Resources".to_vec()) else { return fonts };
+    let res_dict = match res {
+        Value::Dict(_) => Some(res.clone()),
+        Value::Ref(n, _) => doc.obj_dict(*n).map(Value::Dict),
+        _ => None,
+    };
+    if let Some(Value::Dict(rd)) = res_dict {
+        if let Some(fv) = rd.get(&b"Font".to_vec()) {
+            let font_dict = match fv {
+                Value::Dict(_) => Some(fv.clone()),
+                Value::Ref(n, _) => doc.obj_dict(*n).map(Value::Dict),
+                _ => None,
+            };
+            if let Some(Value::Dict(fd)) = font_dict {
+                for (name, fval) in &fd {
+                    let Some(fnum) = (match fval {
+                        Value::Ref(n, _) => Some(*n),
+                        _ => None,
+                    }) else { continue };
+                    let Some(fdict) = doc.obj_dict(fnum) else { continue };
+                    let subtype = match fdict.get(&b"Subtype".to_vec()) {
+                        Some(Value::Name(n)) => n.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut fm = FontMap { two_byte: subtype == b"Type0", cmap: ToUnicode::default() };
+                    if let Some(tu) = fdict.get(&b"ToUnicode".to_vec()).and_then(|v| doc.resolve_ref(v)) {
+                        if let Ok(Some(cmap_src)) = doc.stream_of(tu) {
+                            if cmap_src.len() <= 16 * 1024 * 1024 {
+                                fm.cmap = parse_cmap(&cmap_src);
+                            }
+                        }
+                    }
+                    fonts.insert(name.clone(), fm);
+                }
+            }
+        }
+    }
+    fonts
 }
 
 /// Токенайзер контент-стрима: собирает Tj/TJ/'/" с декодированием по текущему шрифту.
