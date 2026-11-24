@@ -15,6 +15,7 @@
 
 use crate::inflate::zlib_decompress;
 use crate::ports::{ExtractError, Extracted, TextExtractor};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 const MAX_PAGES: usize = 10_000;
@@ -330,10 +331,23 @@ fn byte_to_unicode(b: u8) -> Option<char> {
 
 // ---------------------------------------------------------------- Объекты и документ
 
+/// Запись xref: смещение в файле (тип 1) или «лежит в object stream» (тип 2).
+#[derive(Clone, Copy)]
+enum XEntry {
+    Offset(usize),
+    InStm(u32, u32), // номер ObjStm, индекс внутри
+}
+
 pub struct PdfDoc {
     data: Vec<u8>,
     /// objnum → смещение «N G obj».
     offsets: HashMap<u32, usize>,
+    /// objnum → запись xref (потоковая xref PDF 1.5+).
+    xref: HashMap<u32, XEntry>,
+    /// Номер ObjStm → список (objnum, смещение внутри потока).
+    objstm: RefCell<HashMap<u32, Vec<(u32, usize)>>>,
+    /// Распакованное содержимое ObjStm: номер → (First, байты).
+    objstm_data: RefCell<HashMap<u32, (usize, Vec<u8>)>>,
 }
 
 impl PdfDoc {
@@ -343,9 +357,375 @@ impl PdfDoc {
             // Некоторые PDF начинаются с мусора до %PDF — ищем подпись в первых 2 КБ
             let head = &data[..data.len().min(2048)];
             let off = find(head, b"%PDF").ok_or(ExtractError::NotPdf)?;
-            return Ok(Self { data: data[off..].to_vec(), offsets: HashMap::new() });
+            return Ok(Self {
+                data: data[off..].to_vec(),
+                offsets: HashMap::new(),
+                xref: HashMap::new(),
+                objstm: RefCell::new(HashMap::new()),
+                objstm_data: RefCell::new(HashMap::new()),
+            });
         }
-        Ok(Self { data, offsets: HashMap::new() })
+        Ok(Self {
+            data,
+            offsets: HashMap::new(),
+            xref: HashMap::new(),
+            objstm: RefCell::new(HashMap::new()),
+            objstm_data: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Разбор словаря, начинающегося в позиции pos (пропуск «N G obj», пробелов).
+    fn dict_at(&self, pos: usize) -> Option<HashMap<Vec<u8>, Value>> {
+        let span = &self.data[pos.min(self.data.len())..];
+        let mut start = 0usize;
+        // Для «N 0 obj»Case: ищем «obj» в первых 32 байтах и пропускаем его
+        if let Some(o) = find(&span[..span.len().min(64)], b"obj") {
+            let after = o + 3;
+            let mut j = after;
+            while j < span.len() && is_ws(span[j]) {
+                j += 1;
+            }
+            if j < span.len() {
+                start = j;
+            }
+        }
+        let mut p = Parser::new(&span[start..]);
+        match p.parse() {
+            Ok(Value::Dict(d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Число из Value (Num или Ref→obj_dict не нужно здесь).
+    fn num_of(v: &Value) -> Option<i64> {
+        match v {
+            Value::Num(n) => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    /// Распаковка потока объекта с учётом /Filter (FlateDecode) — сырые байты для xref/objstm.
+    fn raw_stream_at(&self, pos: usize) -> Option<(HashMap<Vec<u8>, Value>, Vec<u8>)> {
+        let dbg = std::env::var("PDFCAT_DEBUG").as_deref() == Ok("1");
+        let span = &self.data[pos.min(self.data.len())..];
+        let Some(srel) = find(span, b"stream") else {
+            if dbg { eprintln!("[raw_stream] no 'stream' at {pos}"); }
+            return None;
+        };
+        if dbg { eprintln!("[raw_stream] at {pos}: srel={srel} span={}", span.len()); }
+        let dict_span = &span[..srel];
+        let mut dict = match Parser::new(dict_span).parse() {
+            Ok(Value::Dict(d)) => d,
+            _ => {
+                // Заголовок «N G obj» перед словарем — пропускаем
+                let head = &dict_span[..dict_span.len().min(64)];
+                let Some(o) = find(head, b"obj") else {
+                    if dbg { eprintln!("[raw_stream] dict parse failed, no obj header"); }
+                    return None;
+                };
+                let mut j = o + 3;
+                while j < dict_span.len() && is_ws(dict_span[j]) {
+                    j += 1;
+                }
+                match Parser::new(&dict_span[j..]).parse() {
+                    Ok(Value::Dict(d)) => d,
+                    _ => {
+                        if dbg { eprintln!("[raw_stream] dict parse failed after header"); }
+                        return None;
+                    }
+                }
+            }
+        };
+        let mut ds = srel + 6;
+        if span.get(ds) == Some(&b'\r') {
+            ds += 1;
+            if span.get(ds) == Some(&b'\n') {
+                ds += 1;
+            }
+        } else if span.get(ds) == Some(&b'\n') {
+            ds += 1;
+        }
+        let len_opt = match dict.get(&b"Length".to_vec()) {
+            Some(Value::Num(n)) if n.is_finite() && *n >= 0.0 => Some(*n as usize),
+            Some(Value::Ref(n, _)) => self.obj_dict(*n).and_then(|d| match d.get(&b"Length".to_vec()) {
+                Some(Value::Num(v)) if v.is_finite() && *v >= 0.0 => Some(*v as usize),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let raw: Vec<u8> = if let Some(len) = len_opt {
+            let end = (ds + len).min(span.len());
+            span[ds..end].to_vec()
+        } else {
+            // fallback: до endstream
+            let e = find(&span[ds..], b"endstream")?;
+            span[ds..ds + e].to_vec()
+        };
+        let out = match dict.remove(&b"Filter".to_vec()) {
+            Some(Value::Name(n)) if n == b"FlateDecode" => {
+                match crate::inflate::zlib_decompress_tolerant(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if dbg {
+                            eprintln!("[raw_stream] inflate fail: {e:?}, raw len {}", raw.len());
+                            let _ = std::fs::write("target/debug_stream.bin", &raw);
+                        }
+                        return None;
+                    }
+                }
+            }
+            Some(Value::Array(items)) => {
+                let mut acc = raw.clone();
+                for it in items {
+                    if let Value::Name(n) = it {
+                        if n == b"FlateDecode" {
+                            acc = crate::inflate::zlib_decompress(&acc).ok()?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                acc
+            }
+            _ => raw,
+        };
+        Some((dict, out))
+    }
+
+    /// PNG-предиктор 12 (Up): снять предсказание по строкам.
+    fn unpredict(mut data: Vec<u8>, columns: usize) -> Vec<u8> {
+        if columns == 0 || data.is_empty() {
+            return data;
+        }
+        let row_len = columns + 1; // 1 байт — тип фильтра
+        let rows = data.len() / row_len;
+        for r in 1..rows {
+            for c in 1..=columns {
+                let i = r * row_len + c;
+                if i >= data.len() {
+                    break;
+                }
+                let above = data[(r - 1) * row_len + c];
+                data[i] = data[i].wrapping_add(above);
+            }
+        }
+        // Убираем байты фильтров: сдвигаем строки влево
+        let mut out = Vec::with_capacity(rows * columns);
+        for r in 0..rows {
+            let start = r * row_len + 1;
+            let end = (start + columns).min(data.len());
+            if start < data.len() {
+                out.extend_from_slice(&data[start..end]);
+            }
+        }
+        out
+    }
+
+    /// Пройти цепочку xref: потоковые (PDF 1.5+) и классические секции.
+    pub(crate) fn load_xref(&mut self, start: usize) {
+        let dbg = std::env::var("PDFCAT_DEBUG").as_deref() == Ok("1");
+        let mut cur = start;
+        for _ in 0..32 {
+            if cur >= self.data.len() {
+                return;
+            }
+            let Some(dict) = self.dict_at(cur) else {
+                if dbg { eprintln!("[xref] dict_at({cur}) failed"); }
+                return;
+            };
+            if dbg {
+                let keys: Vec<String> = dict.keys().take(8).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+                eprintln!("[xref] dict at {cur}: {keys:?}");
+            }
+            let is_xref_stream = matches!(dict.get(&b"Type".to_vec()), Some(Value::Name(n)) if n == b"XRef");
+            if dbg { eprintln!("[xref] is_xref_stream={is_xref_stream}"); }
+            if is_xref_stream {
+                let w = dict.get(&b"W".to_vec());
+                let widths: Vec<usize> = match w {
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|v| Some(Self::num_of(v)? as usize))
+                        .collect(),
+                    _ => return,
+                };
+                if dbg { eprintln!("[xref] widths={widths:?}"); }
+                if widths.len() < 3 {
+                    return;
+                }
+                let row_len: usize = widths.iter().sum();
+                if dbg { eprintln!("[xref] row_len={row_len}"); }
+                if row_len == 0 {
+                    return;
+                }
+                // Индексы: /Index [s n s n …] или [0 /Size]
+                let mut ranges: Vec<(u32, u32)> = Vec::new();
+                if let Some(Value::Array(items)) = dict.get(&b"Index".to_vec()) {
+                    let flat: Vec<i64> = items.iter().filter_map(Self::num_of).collect();
+                    let mut k = 0;
+                    while k + 1 < flat.len() {
+                        ranges.push((flat[k] as u32, flat[k + 1] as u32));
+                        k += 2;
+                    }
+                } else {
+                    let n = dict
+                        .get(&b"Size".to_vec())
+                        .and_then(Self::num_of)
+                        .unwrap_or(0) as u32;
+                    ranges.push((0, n));
+                }
+                let columns_total: u32 = ranges.iter().map(|(_, c)| *c).sum();
+                let (ddict, mut bytes) = match self.raw_stream_at(cur) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let _ = ddict;
+                // Предиктор 12 (PNG Up)
+                let predictor = dict
+                    .get(&b"DecodeParms".to_vec())
+                    .and_then(|dp| match dp {
+                        Value::Dict(dp) => dp.get(&b"Predictor".to_vec()),
+                        _ => None,
+                    })
+                    .or_else(|| dict.get(&b"Predictor".to_vec()))
+                    .and_then(Self::num_of)
+                    .unwrap_or(1);
+                if dbg {
+                    eprintln!("[xref] W={widths:?} row_len={row_len} ranges={ranges:?} raw={} predictor={predictor}", bytes.len());
+                }
+
+                if predictor >= 10 {
+                    bytes = Self::unpredict(bytes, (columns_total as usize) * row_len);
+                }
+                if dbg { eprintln!("[xref] after unpredict: {}", bytes.len()); }
+                let mut pos = 0usize;
+                for (start_num, count) in ranges {
+                    for i in 0..count {
+                        if pos + row_len > bytes.len() {
+                            return;
+                        }
+                        let fields: Vec<u32> = widths
+                            .iter()
+                            .scan(0usize, |acc, w| {
+                                let mut v = 0u32;
+                                for b in 0..*w {
+                                    if pos + *acc + b >= bytes.len() {
+                                        break;
+                                    }
+                                    v = (v << 8) | bytes[pos + *acc + b] as u32;
+                                }
+                                *acc += *w;
+                                Some(v)
+                            })
+                            .collect();
+                        if fields.len() < 3 {
+                            return;
+                        }
+                        let obj = start_num + i;
+                        match fields[0] {
+                            0 => {}
+                            1 => {
+                                self.xref
+                                    .entry(obj)
+                                    .or_insert(XEntry::Offset(fields[1] as usize));
+                            }
+                            2 => {
+                                self.xref
+                                    .entry(obj)
+                                    .or_insert(XEntry::InStm(fields[1], fields[2]));
+                            }
+                            _ => {}
+                        }
+                        pos += row_len;
+                    }
+                }
+                match dict.get(&b"Prev".to_vec()).and_then(Self::num_of) {
+                    Some(p) if p > 0 => cur = p as usize,
+                    _ => return,
+                }
+            } else {
+                // Классическая таблица: «xref» + секции
+                return;
+            }
+            if dbg { eprintln!("[xref] xref map total now {}", self.xref.len()); }
+        }
+    }
+
+    /// Object stream: распаковать и получить (First, байты) — вызывается лениво.
+    fn objstm_load(&self, num: u32) -> Option<()> {
+        let dbg = std::env::var("PDFCAT_DEBUG").as_deref() == Ok("1");
+        if self.objstm_data.borrow().contains_key(&num) {
+            return Some(());
+        }
+        let off = match self.xref.get(&num) {
+            Some(XEntry::Offset(o)) => *o,
+            _ => self.offsets.get(&num).copied()?,
+        };
+        let (dict, bytes) = match self.raw_stream_at(off) {
+            Some(v) => v,
+            None => {
+                if dbg { eprintln!("[objstm] no stream at {off}"); }
+                return None;
+            }
+        };
+        let n = match dict.get(&b"N".to_vec()).and_then(Self::num_of) {
+            Some(v) => v as usize,
+            None => {
+                if dbg { eprintln!("[objstm] no /N"); }
+                return None;
+            }
+        };
+        let first = Self::num_of(dict.get(&b"First".to_vec())?)? as usize;
+        // Первые First байт: N пар (objnum, смещение)
+        let head = &bytes[..first.min(bytes.len())];
+        let nums: Vec<i64> = {
+            let mut out = Vec::new();
+            let mut p = Parser::new(head);
+            while let Ok(v) = p.parse() {
+                if let Some(n) = Self::num_of(&v) {
+                    out.push(n);
+                }
+                if out.len() >= n * 2 {
+                    break;
+                }
+            }
+            out
+        };
+        let mut list = Vec::with_capacity(n);
+        for i in 0..n {
+            if i * 2 + 1 >= nums.len() {
+                break;
+            }
+            list.push((nums[i * 2] as u32, nums[i * 2 + 1] as usize));
+        }
+        self.objstm.borrow_mut().insert(num, list);
+        self.objstm_data.borrow_mut().insert(num, (first, bytes));
+        Some(())
+    }
+
+    /// Объект из object stream (по номеру объекта).
+    fn objstm_value(&self, num: u32) -> Option<Value> {
+        // Ищем ObjStm: линейный перебор по кешу xref (тип 2: InStm)
+        let (stm_num, idx) = match self.xref.get(&num) {
+            Some(XEntry::InStm(s, i)) => (*s, *i),
+            _ => return None,
+        };
+        self.objstm_load(stm_num)?;
+        let list = self.objstm.borrow();
+        let list = list.get(&stm_num)?;
+        if (idx as usize) >= list.len() {
+            return None;
+        }
+        let (_, rel) = list[idx as usize];
+        let guard = self.objstm_data.borrow();
+        let (first, bytes) = guard.get(&stm_num)?;
+        let abs = first + rel;
+        if abs >= bytes.len() {
+            return None;
+        }
+        match Parser::new(&bytes[abs..]).parse() {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        }
     }
 
     /// Fallback-скан: все «N G obj». Работает и без xref; O(размер файла).
@@ -354,6 +734,26 @@ impl PdfDoc {
         if !self.offsets.is_empty() {
             return;
         }
+        // Потоковая xref (PDF 1.5+): строим её один раз, скан файла не нужен
+        if self.xref.is_empty() {
+            let tail_start = self.data.len().saturating_sub(4096);
+            let tail = &self.data[tail_start..].to_vec();
+            if let Some(x) = rfind(tail, b"startxref") {
+                let s = std::str::from_utf8(&tail[x + 9..]).unwrap_or("");
+                if let Ok(num) = s.split_whitespace().next().unwrap_or("0").parse::<u32>() {
+                    if num > 0 && (num as usize) < self.data.len() {
+                        self.load_xref(num as usize);
+                    }
+                }
+            }
+        }
+        if self.xref.is_empty() {
+            self.scan_objects();
+        }
+    }
+
+    /// Fallback-скан: все «N G obj» (нет xref или битый xref). O(размер файла).
+    fn scan_objects(&mut self) {
         let data = std::mem::take(&mut self.data);
         let mut i = 0;
         while i + 4 <= data.len() {
@@ -397,7 +797,14 @@ impl PdfDoc {
     }
 
     fn obj_start(&self, num: u32) -> Option<usize> {
-        self.offsets.get(&num).copied()
+        if let Some(o) = self.offsets.get(&num) {
+            return Some(*o);
+        }
+        match self.xref.get(&num) {
+            Some(XEntry::Offset(o)) => Some(*o),
+            Some(XEntry::InStm(_, _)) => None,
+            None => None,
+        }
     }
 
     pub(crate) fn obj_body(&self, num: u32) -> Option<(usize, usize)> {
@@ -506,6 +913,39 @@ impl PdfDoc {
     }
 
     pub(crate) fn obj_dict(&self, num: u32) -> Option<HashMap<Vec<u8>, Value>> {
+        let dbg = std::env::var("PDFCAT_DEBUG").as_deref() == Ok("1");
+        if dbg {
+            let ent = self.xref.get(&num);
+            let ent_s = match ent {
+                Some(XEntry::Offset(o)) => format!("Offset({o})"),
+                Some(XEntry::InStm(a, b)) => format!("InStm({a},{b})"),
+                None => "none".to_string(),
+            };
+            eprintln!("[obj_dict] #{num}: xref={ent_s} offsets={:?}", self.offsets.get(&num));
+        }
+        // Объект может лежать в object stream (PDF 1.5+)
+        if matches!(self.xref.get(&num), Some(XEntry::InStm(_, _))) {
+            let v = self.objstm_value(num);
+            if dbg {
+                let kind = match &v {
+                    Some(Value::Dict(_)) => "Dict",
+                    Some(Value::Array(_)) => "Array",
+                    Some(Value::Num(_)) => "Num",
+                    Some(Value::Name(_)) => "Name",
+                    Some(Value::Bool(_)) => "Bool",
+                    Some(Value::Str(_)) => "Str",
+                    Some(Value::Str(_)) => "Str",
+                    Some(Value::Ref(..)) => "Ref",
+                    Some(Value::Null) => "Null",
+                    None => "NONE",
+                };
+                eprintln!("[objstm] #{num} -> {kind}");
+            }
+            return match v {
+                Some(Value::Dict(d)) => Some(d),
+                _ => None,
+            };
+        }
         let (start, end) = self.obj_body(num)?;
         let mut p = Parser::new(&self.data[start..end]);
         match p.parse() {
@@ -550,15 +990,25 @@ impl PdfDoc {
                         }
                     }
                 }
-                // /Type /XRef — потоковая xref (PDF 1.5+): честный отказ
+                // /Type /XRef — потоковая xref (PDF 1.5): Root лежит в том же словаре
                 if find(span, b"/XRef").is_some() {
-                    return Err(ExtractError::Unsupported("xref streams (PDF 1.5+)"));
+                    if let Some(d) = self.dict_at(num as usize) {
+                        if let Some(r) = d.get(&b"Root".to_vec()) {
+                            if let Some(n) = self.resolve_ref(r) {
+                                return Ok(n);
+                            }
+                        }
+                    }
                 }
             }
         }
-        // Fallback: ищем объект с /Catalog
+        // Fallback: объект с /Catalog среди всех известных (xref + скан)
         self.build_index();
-        for (&num, _) in &self.offsets {
+        let mut cands: Vec<u32> = self.offsets.keys().copied().collect();
+        cands.extend(self.xref.keys().copied());
+        cands.sort_unstable();
+        cands.dedup();
+        for num in cands.into_iter().take(5000) {
             if let Some(d) = self.obj_dict(num) {
                 if matches!(d.get(&b"Type".to_vec()), Some(Value::Name(n)) if n == b"Catalog") {
                     return Ok(num);

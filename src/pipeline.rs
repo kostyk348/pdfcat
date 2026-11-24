@@ -27,6 +27,115 @@ pub struct PipelineStats {
 
 /// Скан + сохранение каталога + параллельная индексация + сохранение индекса.
 /// `progress` — колбэк статуса (для GUI-статусной строки / CLI-вывода).
+/// Скан каталога БЕЗ индексации текста: быстро строит дерево/граф.
+pub fn scan_catalog(
+    root: &str,
+    db: &Path,
+    max_depth: u32,
+    progress: &std::sync::Mutex<String>,
+) -> Result<PipelineStats, String> {
+    let t0 = std::time::Instant::now();
+    let mut cat = Catalog::new();
+    let mut s = FsScanner;
+    let st = s.scan(root, &mut cat, max_depth);
+    let scan_ms = t0.elapsed().as_millis() as u64;
+    if cat.verify().is_err() {
+        return Err("инвариант каталога нарушен".into());
+    }
+    let cat_path = db.join("catalog.pdfcat");
+    cat.save(cat_path.to_string_lossy().as_ref())
+        .map_err(|e| format!("сохранение каталога: {e}"))?;
+    if let Ok(mut g) = progress.lock() {
+        *g = format!("скан готов: {} каталогов, {} PDF за {} мс", st.dirs, st.pdfs, scan_ms);
+    }
+    Ok(PipelineStats {
+        dirs: st.dirs,
+        files: st.files,
+        pdfs: st.pdfs,
+        scan_ms,
+        ..Default::default()
+    })
+}
+
+/// Параллельная индексация всех PDF каталога (явный вызов пользователя).
+pub fn index_catalog(
+    db: &Path,
+    threads: usize,
+    progress: &std::sync::Mutex<String>,
+) -> Result<PipelineStats, String> {
+    let cat = Catalog::load(db.join("catalog.pdfcat").to_string_lossy().as_ref())
+        .map_err(|e| format!("нет каталога ({e}); сначала скан"))?;
+    let t1 = std::time::Instant::now();
+    let n = cat.entries.len();
+    if n == 0 {
+        return Err("каталог пуст".into());
+    }
+    let nthreads = threads.clamp(1, 16);
+    let chunk = (n + nthreads - 1) / nthreads.max(1);
+    let mut partials: Vec<Bm25> = Vec::new();
+    let mut err_counts: Vec<u32> = Vec::new();
+    let done_counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let cat_ref = &cat;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads).map(|t| {
+            let done = std::sync::Arc::clone(&done_counter);
+            scope.spawn(move || {
+                let mut idx = Bm25::new();
+                let mut errs = 0u32;
+                let ex = PdfExtractor;
+                let start = (t * chunk) as usize;
+                let end = ((t + 1) * chunk).min(n);
+                for id in start..end {
+                    let path = cat_ref.entry_path(id as u32).to_string();
+                    match ex.extract(&path, MAX_PDF_BYTES) {
+                        Ok(x) => {
+                            let text = x.pages.join("\n");
+                            idx.index((id - start) as u32, &text);
+                        }
+                        Err(_) => errs += 1,
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 25 == 0 {
+                        if let Ok(mut g) = progress.lock() {
+                            *g = format!("индексирую {d}/{n}…");
+                        }
+                    }
+                }
+                (idx, errs)
+        })
+        })
+        .collect();
+        for h in handles {
+            if let Ok((idx, errs)) = h.join() {
+                err_counts.push(errs);
+                partials.push(idx);
+            }
+        }
+    });
+    let mut full = Bm25::new();
+    for (t, part) in partials.into_iter().enumerate() {
+        full.merge_chunk(part, (t * chunk) as u32);
+    }
+    let (terms, tokens) = full.stats();
+    let err_total: u32 = err_counts.iter().sum();
+    let index_ms = t1.elapsed().as_millis() as u64;
+    let idx_path = db.join("index.pdfcat");
+    full.save(idx_path.to_string_lossy().as_ref())
+        .map_err(|e| format!("сохранение индекса: {e}"))?;
+    if let Ok(mut g) = progress.lock() {
+        *g = format!("индекс готов: терминов {terms}, токенов {tokens}, ошибок {err_total}");
+    }
+    Ok(PipelineStats {
+        pdfs: n as u32,
+        indexed: n as u32,
+        errors: err_total,
+        index_ms,
+        tokens,
+        terms,
+        ..Default::default()
+    })
+}
+
 pub fn scan_and_index(
     root: &str,
     db: &Path,

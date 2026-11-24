@@ -282,6 +282,22 @@ pub fn adler32(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
+/// zstd: терпимая распаковка: /Length некоторых файлов включает завершающий CR/LF
+/// перед endstream — пробуем откусить один байт, если adler не сошёлся.
+pub fn zlib_decompress_tolerant(data: &[u8]) -> Result<Vec<u8>, InflateError> {
+    match zlib_decompress(data) {
+        Ok(v) => Ok(v),
+        Err(InflateError::AdlerMismatch) => {
+            if data.len() > 6 && matches!(data.last(), Some(b'\n') | Some(b'\r')) {
+                zlib_decompress(&data[..data.len() - 1])
+            } else {
+                Err(InflateError::AdlerMismatch)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Полный zlib-поток: заголовок + deflate + adler32.
 pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, InflateError> {
     if data.len() < 6 {
@@ -298,6 +314,7 @@ pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, InflateError> {
     let out = inflate(body)?;
     let expect = u32::from_be_bytes([data[data.len() - 4], data[data.len() - 3], data[data.len() - 2], data[data.len() - 1]]);
     if adler32(&out) != expect {
+
         return Err(InflateError::AdlerMismatch);
     }
     Ok(out)
@@ -324,5 +341,23 @@ mod tests {
     #[test]
     fn truncated_rejected() {
         assert_eq!(inflate(&[0x07]), Err(InflateError::BadBlock)); // BFINAL=1, BTYPE=11 — запрещено
+    }
+}
+
+#[cfg(test)]
+mod real_streams {
+    use super::zlib_decompress_tolerant;
+
+    #[test]
+    fn real_objstm_stream() {
+        let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/objstm_stream.bin"))
+            .expect("fixture objstm_stream.bin");
+        match zlib_decompress_tolerant(&raw) {
+            Ok(v) => {
+                println!("распаковано {} байт: {:?}", v.len(), String::from_utf8_lossy(&v[..v.len().min(40)]));
+                assert_eq!(v.len(), 436, "длина не совпала с эталоном (python: 436)");
+            }
+            Err(e) => panic!("zlib_decompress: {e:?}"),
+        }
     }
 }

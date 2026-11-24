@@ -97,6 +97,7 @@ pub struct UiState {
     pub btn_mode_tree: (i32, i32, i32, i32),
     pub btn_mode_graph: (i32, i32, i32, i32),
     pub btn_scan: (i32, i32, i32, i32),
+    pub btn_index: (i32, i32, i32, i32),
 }
 
 #[derive(Default, Clone, Copy)]
@@ -145,6 +146,7 @@ impl UiState {
             btn_mode_tree: (0, 0, 0, 0),
             btn_mode_graph: (0, 0, 0, 0),
             btn_scan: (0, 0, 0, 0),
+            btn_index: (0, 0, 0, 0),
         };
         s.rebuild_tree();
         s.set_status(&format!(
@@ -241,6 +243,11 @@ pub fn on_click(c: &mut Ctx, x: i32, y: i32) {
         if let Some(root) = pick_folder(c.hwnd) {
             do_scan(c, root);
         }
+        return;
+    }
+    let (ix, iy, iw, ih) = ui.btn_index;
+    if x >= ix && x < ix + iw && y >= iy && y < iy + ih {
+        do_index(c);
         return;
     }
     let (sx, sy, sw, sh) = ui.r_search;
@@ -486,7 +493,7 @@ pub fn do_scan(c: &mut Ctx, root: String) {
     c.worker = Some(std::sync::Arc::clone(&worker));
     let w = std::sync::Arc::clone(&worker);
     std::thread::spawn(move || {
-        match crate::pipeline::scan_and_index(&root, &db, 16, 8, &w.progress) {
+        match crate::pipeline::scan_catalog(&root, &db, 16, &w.progress) {
             Ok(st) => {
                 if let Ok(mut g) = w.progress.lock() {
                     *g = format!(
@@ -502,6 +509,35 @@ pub fn do_scan(c: &mut Ctx, root: String) {
             }
         }
         w.done.store(true, Ordering::Relaxed);
+    });
+}
+
+pub fn do_index(c: &mut Ctx) {
+    let db = c.ui.db.clone();
+    let worker = std::sync::Arc::new(Worker {
+        progress: std::sync::Mutex::new("индексирую…".into()),
+        done: std::sync::atomic::AtomicBool::new(false),
+        root: String::from("index"),
+    });
+    c.worker = Some(std::sync::Arc::clone(&worker));
+    let w = std::sync::Arc::clone(&worker);
+    std::thread::spawn(move || {
+        match crate::pipeline::index_catalog(&db, 8, &w.progress) {
+            Ok(st) => {
+                if let Ok(mut g) = w.progress.lock() {
+                    *g = format!(
+                        "индексация: {} PDF, {} ошибок, {} терминов, {} токенов, {} мс",
+                        st.pdfs, st.errors, st.terms, st.tokens, st.index_ms
+                    );
+                }
+            }
+            Err(e) => {
+                if let Ok(mut g) = w.progress.lock() {
+                    *g = format!("индексация не удалась: {e}");
+                }
+            }
+        }
+        w.done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -596,6 +632,13 @@ pub fn draw_frame(ctx: &mut Ctx) {
     let (sw, _) = measure_btn("Сканировать…", 15);
     bx -= sw + 24;
     ctx.ui.btn_scan = (bx, by, sw + 24, bh);
+    // слева — «Индексировать» (параллельная индексация текста по уже просканированному каталогу)
+    let (iw, _) = measure_btn("Индексировать", 15);
+    let ix = bx - (iw + 24) - 8;
+    ctx.ui.btn_index = (ix, by, iw + 24, bh);
+    fill(ctx, ix, by, iw + 24, bh, TILE);
+    fill(ctx, ix, by, 1, bh, BORDER);
+    text(ctx, ix + 12, by + 7, "Индексировать", 15, FW_SEMIBOLD, ACCENT);
     fill(ctx, bx, by, sw + 24, bh, TILE);
     fill(ctx, bx, by, 1, bh, BORDER);
     text(ctx, bx + 12, by + 7, "Сканировать…", 15, FW_SEMIBOLD, ACCENT);
