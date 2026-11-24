@@ -18,6 +18,10 @@ mod ui;
 mod win;
 
 fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        win::startup_log(&format!("PANIC: {info}"));
+    }));
+    win::startup_log("pdfcat запущен");
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(|s| s.as_str()) {
         None => win::run_gui(),

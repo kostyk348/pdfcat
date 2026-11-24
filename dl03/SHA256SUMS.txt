@@ -1,0 +1,2 @@
+ac4de01c259527ddb46d6b555dd18db097af2aba900093e0ed35f05c4e0c1ecd *target/x86_64-pc-windows-gnu/release/pdfcat-0.3.0-win7-x64.exe
+bec7c88a363f6c7d1e839a005619ea7b4d7ff3beec542afeb2e57d69c5dbbcfa *target/release/pdfcat-0.3.0-win64.exe

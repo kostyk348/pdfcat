@@ -128,6 +128,7 @@ pub struct BrowseInfoW {
 #[link(name = "user32")]
 extern "system" {
     pub fn LoadImageW(hinst: isize, name: *const u16, typ: u32, cx: i32, cy: i32, load: u32) -> isize;
+    pub fn LoadIconW(hinst: isize, name: *const u16) -> isize;
     pub fn RegisterClassW(pc: *const WndClassW) -> u16;
     pub fn CreateWindowExW(
         ex: u32, class: *const u16, title: *const u16, style: u32,
@@ -420,6 +421,28 @@ fn resize_dib(c: &mut Ctx, w: i32, h: i32) {
     }
 }
 
+/// Журнал старта: %LOCALAPPDATA%\pdfcat\startup.log (append). Для диагностики вылетов на Win7.
+pub fn startup_log(msg: &str) {
+    if let Some(dir) = std::env::var("LOCALAPPDATA").ok() {
+        let p = std::path::Path::new(&dir).join("pdfcat");
+        if std::fs::create_dir_all(&p).is_err() {
+            return;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p.join("startup.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[{ts}] {msg}");
+        }
+    }
+}
+
 /// Папка БД: рядом с exe; если недоступна для записи — %LOCALAPPDATA%\pdfcat (решение владельца).
 pub fn db_dir() -> std::path::PathBuf {
     unsafe {
@@ -551,7 +574,9 @@ pub fn run_gui() -> i32 {
                 win_h = win_h.min((ra.b - ra.t) - 60).max(600);
             }
         }
+        startup_log("старт GUI: FreeConsole пройден, получаю модуль…");
         let hinst = GetModuleHandleW(std::ptr::null());
+        startup_log("GetModuleHandleW ok");
         let class_name = utf8_to_wide("pdfcat_window");
         let wc = WndClassW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -560,13 +585,23 @@ pub fn run_gui() -> i32 {
             cb_wnd_extra: 0,
             h_instance: hinst,
             // иконка из ресурса exe (1 ICON в resource.rc); fallback — стандартная
-            h_icon: LoadImageW(hinst, 1 as _, 1, 0, 0, 0x00000010) as _,
+            h_icon: {
+                let h = LoadImageW(hinst, 1 as _, 1, 0, 0, 0x00000010);
+                startup_log(&format!("LoadImageW(иконка) = {h:#x}"));
+                if h == 0 {
+                    // IDI_APPLICATION = MAKEINTRESOURCE(32512)
+                    LoadIconW(0, 32512 as _) as _
+                } else {
+                    h as _
+                }
+            },
             h_cursor: LoadCursorW(0, IDC_ARROW),
             h_br_background: 0,
             lpsz_menu_name: std::ptr::null(),
             lpsz_class_name: class_name.as_ptr(),
         };
         RegisterClassW(&wc);
+        startup_log("RegisterClassW ok");
 
         let ui = UiState::load_or_empty(&db_dir());
         let ctx = Box::new(Ctx {
@@ -599,6 +634,7 @@ pub fn run_gui() -> i32 {
             hinst,
             std::ptr::null_mut(),
         );
+        startup_log("CreateWindowExW ok");
         (*CTX).hwnd = hwnd;
         resize_dib(&mut *CTX, win_w, win_h);
         ShowWindow(hwnd, SW_SHOW);
