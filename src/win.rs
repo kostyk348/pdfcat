@@ -584,17 +584,9 @@ pub fn run_gui() -> i32 {
             cb_cls_extra: 0,
             cb_wnd_extra: 0,
             h_instance: hinst,
-            // иконка из ресурса exe (1 ICON в resource.rc); fallback — стандартная
-            h_icon: {
-                let h = LoadImageW(hinst, 1 as _, 1, 0, 0, 0x00000010);
-                startup_log(&format!("LoadImageW(иконка) = {h:#x}"));
-                if h == 0 {
-                    // IDI_APPLICATION = MAKEINTRESOURCE(32512)
-                    LoadIconW(0, 32512 as _) as _
-                } else {
-                    h as _
-                }
-            },
+            // Win7: LoadImageW из нашего .rsrc вылетает (подтверждено startup.log) —
+            // иконка окна системная; иконка exe в Проводнике/панели задач остаётся из ресурса.
+            h_icon: 0,
             h_cursor: LoadCursorW(0, IDC_ARROW),
             h_br_background: 0,
             lpsz_menu_name: std::ptr::null(),
