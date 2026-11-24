@@ -6,6 +6,7 @@
 
 use crate::ui::{draw_frame, on_char, on_click, on_dbl_click, on_key, on_wheel, UiState, Focus};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type HWND = isize;
 pub type HDC = isize;
@@ -184,6 +185,11 @@ extern "system" {
     pub fn GetTextExtentPoint32W(hdc: HDC, s: *const u16, c: i32, size: *mut Point) -> i32;
     pub fn BitBlt(dst: HDC, dx: i32, dy: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32) -> i32;
     pub fn CreateSolidBrush(color: u32) -> HBRUSH;
+    pub fn StretchDIBits(
+        hdc: HDC, dx: i32, dy: i32, dw: i32, dh: i32,
+        sx: i32, sy: i32, sw: i32, sh: i32,
+        bits: *const std::ffi::c_void, bmi: *const BitmapInfoHeader, usage: u32, rop: u32,
+    ) -> i32;
     pub fn CreatePen(style: i32, width: i32, color: u32) -> HGDIOBJ;
     pub fn MoveToEx(hdc: HDC, x: i32, y: i32, old: *mut Point) -> i32;
     pub fn LineTo(hdc: HDC, x: i32, y: i32) -> i32;
@@ -248,8 +254,15 @@ pub fn colorref(hex: u32) -> u32 {
 
 // ------------------------------------------------------------- Глобальное состояние
 
+pub struct Worker {
+    pub progress: std::sync::Mutex<String>,
+    pub done: std::sync::atomic::AtomicBool,
+    pub root: String,
+}
+
 pub struct Ctx {
     pub ui: UiState,
+    pub worker: Option<std::sync::Arc<Worker>>,
     pub hwnd: HWND,
     pub mem_dc: HDC,
     pub bmp: HBITMAP,
@@ -350,7 +363,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_TIMER => {
                 c.caret_visible = !c.caret_visible;
-                if c.ui.focus == Focus::Search {
+                let mut need_redraw = c.ui.focus == Focus::Search;
+                if let Some(w) = &c.worker {
+                    let done = w.done.load(Ordering::Relaxed);
+                    if let Ok(g) = w.progress.try_lock() {
+                        if *g != c.ui.status {
+                            c.ui.status = g.clone();
+                            need_redraw = true;
+                        }
+                    }
+                    if done {
+                        // Перегрузить каталог и индекс из БД
+                        c.worker = None;
+                        need_redraw = true;
+                        c.ui.reload_requested = true;
+                    }
+                }
+                if need_redraw {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 0
@@ -460,6 +489,7 @@ pub fn render_to_bmp(w: i32, h: i32, ui: UiState, path: &str) -> bool {
         SelectObject(mem, bmp);
         let fonts = Fonts::new();
         let mut c = Ctx {
+            worker: None,
             ui,
             hwnd: 0,
             mem_dc: mem,
@@ -538,6 +568,7 @@ pub fn run_gui() -> i32 {
 
         let ui = UiState::load_or_empty(&db_dir());
         let ctx = Box::new(Ctx {
+            worker: None,
             ui,
             hwnd: 0,
             mem_dc: CreateCompatibleDC(0),

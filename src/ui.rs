@@ -10,6 +10,7 @@ use crate::scan::FsScanner;
 use crate::ports::Source;
 use crate::win::*;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 pub const HEADER_H: i32 = 56;
 pub const STATUS_H: i32 = 28;
@@ -82,6 +83,7 @@ pub struct UiState {
     pub scroll_results: i32,
     pub scroll_preview: i32,
     pub status: String,
+    pub reload_requested: bool,
     pub stats: Stats,
     pub tree: Vec<TreeItem>,
     pub w: i32,
@@ -130,6 +132,7 @@ impl UiState {
             scroll_results: 0,
             scroll_preview: 0,
             status: String::new(),
+            reload_requested: false,
             stats: Stats::default(),
             tree: Vec::new(),
             w: 1440,
@@ -235,7 +238,9 @@ pub fn on_click(c: &mut Ctx, x: i32, y: i32) {
     }
     let (bx, by, bw, bh) = ui.btn_scan;
     if x >= bx && x < bx + bw && y >= by && y < by + bh {
-        do_scan(c.hwnd, ui);
+        if let Some(root) = pick_folder(c.hwnd) {
+            do_scan(c, root);
+        }
         return;
     }
     let (sx, sy, sw, sh) = ui.r_search;
@@ -471,59 +476,33 @@ pub(crate) fn load_preview(ui: &mut UiState, doc_id: u32) {
     }
 }
 
-pub fn do_scan(hwnd: HWND, ui: &mut UiState) {
-    let Some(root) = pick_folder(hwnd) else { return };
-    unsafe {
-        let wait = LoadCursorW(0, 32514 as *const u16);
-        SetCursor(wait);
-    }
-    ui.set_status(&format!("сканирую {root} …"));
-    unsafe {
-        InvalidateRect(hwnd, std::ptr::null(), 0);
-        UpdateWindow(hwnd);
-    }
-
-    let mut cat = Catalog::new();
-    let mut s = FsScanner;
-    let st = s.scan(&root, &mut cat, 16);
-    let cat_path = ui.db.join("catalog.pdfcat");
-    let mut errors = 0u32;
-    if cat.save(cat_path.to_str().unwrap_or("catalog.pdfcat")).is_ok() {
-        let mut idx = Bm25::new();
-        let ex = PdfExtractor;
-        let mut done = 0u32;
-        for id in 0..cat.entries.len() as u32 {
-            let path = cat.entry_path(id).to_string();
-            match ex.extract(&path, 64 * 1024 * 1024) {
-                Ok(x) => {
-                    let text = x.pages.join("\n");
-                    idx.index(id, &text);
-                    cat.entries.indexed[id as usize] = true;
-                    done += 1;
+pub fn do_scan(c: &mut Ctx, root: String) {
+    let db = c.ui.db.clone();
+    let worker = std::sync::Arc::new(Worker {
+        progress: std::sync::Mutex::new(format!("сканирую {root} …")),
+        done: std::sync::atomic::AtomicBool::new(false),
+        root: root.clone(),
+    });
+    c.worker = Some(std::sync::Arc::clone(&worker));
+    let w = std::sync::Arc::clone(&worker);
+    std::thread::spawn(move || {
+        match crate::pipeline::scan_and_index(&root, &db, 16, 8, &w.progress) {
+            Ok(st) => {
+                if let Ok(mut g) = w.progress.lock() {
+                    *g = format!(
+                        "готово: {} каталогов, {} PDF, {} ошибок · скан {} мс · индекс {} мс",
+                        st.dirs, st.pdfs, st.errors, st.scan_ms, st.index_ms
+                    );
                 }
-                Err(_) => errors += 1,
+            }
+            Err(e) => {
+                if let Ok(mut g) = w.progress.lock() {
+                    *g = format!("ошибка: {e}");
+                }
             }
         }
-        let idx_path = ui.db.join("index.pdfcat");
-        let saved = idx.save(idx_path.to_str().unwrap_or("index.pdfcat")).is_ok();
-        ui.catalog = cat;
-        ui.rebuild_tree();
-        ui.index_loaded = saved;
-        ui.results.clear();
-        ui.preview = None;
-        ui.selected = None;
-        ui.stats.errors = errors;
-        ui.set_status(&format!(
-            "скан: {} каталогов, {} PDF, {} мс · индекс: {} документов, {} ошибок",
-            st.dirs, st.pdfs, st.elapsed_ms, done, errors
-        ));
-    } else {
-        ui.set_status("не удалось сохранить каталог рядом с exe");
-    }
-    unsafe {
-        let arrow = LoadCursorW(0, 32512 as *const u16);
-        SetCursor(arrow);
-    }
+        w.done.store(true, Ordering::Relaxed);
+    });
 }
 
 extern "system" {
@@ -588,6 +567,16 @@ fn button(ctx: &Ctx, r: (i32, i32, i32, i32), label: &str, active: bool, text_he
 }
 
 pub fn draw_frame(ctx: &mut Ctx) {
+    // Фоновый воркер закончил — перезагрузить каталог и индекс из БД
+    if ctx.ui.reload_requested {
+        ctx.ui.reload_requested = false;
+        let db = ctx.ui.db.clone();
+        if let Ok(c) = Catalog::load(db.join("catalog.pdfcat").to_str().unwrap_or("")) {
+            ctx.ui.catalog = c;
+            ctx.ui.rebuild_tree();
+        }
+        ctx.ui.index_loaded = ctx.ui.db.join("index.pdfcat").exists();
+    }
     let w = ctx.w;
     let h = ctx.h;
     fill(ctx, 0, 0, w, h, BG);
@@ -597,11 +586,10 @@ pub fn draw_frame(ctx: &mut Ctx) {
 
     let body_top = HEADER_H;
     let body_h = h - HEADER_H - STATUS_H;
-    let right_x = 8 + LEFT_W + 8;
-    let right_w = (w - right_x - 8).max(240);
-    let results_h = (body_h - BOTTOM_H - 8).max(140);
+    let sb_w = 340;
+    let main_w = (w - 16 - sb_w - 8).max(300);
 
-    // ---- Кнопки заголовка (справа)
+    // ---- Кнопки заголовка
     let bh = 32;
     let by = (HEADER_H - bh) / 2;
     let mut bx = w - 8;
@@ -621,111 +609,25 @@ pub fn draw_frame(ctx: &mut Ctx) {
     ctx.ui.btn_mode_tree = (bx, by, tw2 + 20, bh);
     button(ctx, ctx.ui.btn_mode_tree, "Дерево", ctx.ui.mode == Mode::Tree, if ctx.ui.mode == Mode::Tree { 0x06202B } else { TEXT });
 
-    let r_tree = Tile { x: 8, y: body_top, w: LEFT_W, h: body_h, title: "Каталог" };
-    let r_results = Tile { x: right_x, y: body_top, w: right_w, h: results_h, title: "Результаты поиска" };
-    let r_stats = Tile { x: right_x, y: body_top + results_h + 8, w: STATS_W, h: BOTTOM_H, title: "Статистика" };
-    let r_preview = Tile {
-        x: right_x + STATS_W + 8,
-        y: body_top + results_h + 8,
-        w: (right_w - STATS_W - 8).max(200),
-        h: BOTTOM_H,
-        title: "Превью текста",
-    };
+    // ---- Геометрия: превью — основа экрана, каталог/результаты — сайдбар
+    let r_preview = Tile { x: 8, y: body_top, w: main_w, h: body_h, title: "Превью PDF" };
+    let sb_x = 8 + main_w + 8;
+    let r_search = Tile { x: sb_x, y: body_top, w: sb_w, h: 72, title: "Поиск" };
+    let results_h = ((body_h - 72 - 160 - 24) * 2 / 5).max(120);
+    let r_results = Tile { x: sb_x, y: body_top + 72, w: sb_w, h: results_h, title: "Результаты" };
+    let cat_h = (body_h - 72 - results_h - 160 - 24).max(120);
+    let r_tree = Tile { x: sb_x, y: body_top + 72 + results_h + 8, w: sb_w, h: cat_h, title: "Каталог" };
+    let r_stats = Tile { x: sb_x, y: body_top + body_h - 168, w: sb_w, h: 160, title: "Статистика" };
 
-    // ---- Дерево / Граф
-    tile(ctx, &r_tree);
-    ctx.ui.r_tree = r_tree.xywh();
-    match ctx.ui.mode {
-        Mode::Tree => draw_tree(ctx, &r_tree),
-        Mode::Graph => draw_graph(ctx, &r_tree),
-    }
-
-    // ---- Результаты: поле поиска + список
-    tile(ctx, &r_results);
-    ctx.ui.r_results = r_results.xywh();
-    {
-        let (sx, sy, sw, _) = r_results.xywh();
-        let sh = 40;
-        fill(ctx, sx + 14, sy + 30, sw - 28, sh, HOVER);
-        fill(ctx, sx + 14, sy + 30, 1, sh, BORDER);
-        fill(ctx, sx + sw - 15, sy + 30, 1, sh, BORDER);
-        ctx.ui.r_search = (sx + 14, sy + 30, sw - 28, sh);
-        let q = ctx.ui.query.clone();
-        let cx = text(ctx, sx + 24, sy + 36, &q, 15, FW_NORMAL, TEXT);
-        if q.is_empty() {
-            text(ctx, sx + 24, sy + 36, "поиск по имени и тексту — Enter…", 15, FW_NORMAL, 0x5B6878);
-        }
-        if ctx.ui.focus == Focus::Search && ctx.caret_visible {
-            fill(ctx, sx + 24 + cx, sy + 36, 2, 20, ACCENT);
-        }
-        // список
-        let (x, y, wid, hei) = r_results.xywh();
-        let row_h = 26;
-        let list_top = y + 84;
-        let max_rows = ((hei - 94) / row_h + 1) as i32;
-        let base = (ctx.ui.scroll_results / row_h) as usize;
-        let count = ctx.ui.results.len();
-        for (i, &(doc, score)) in ctx.ui.results.iter().enumerate().skip(base).take(max_rows as usize) {
-            let cy = list_top + (i as i32) * row_h - ctx.ui.scroll_results;
-            if cy < list_top - row_h || cy > y + hei - 8 {
-                continue;
-            }
-            let selected = ctx.ui.selected == Some(doc);
-            if selected {
-                fill(ctx, x + 8, cy - 2, wid - 16, row_h, HOVER);
-            }
-            let name = ctx.ui.catalog.entry_name(doc).to_string();
-            text(ctx, x + 20, cy, &name, 13, FW_SEMIBOLD, if selected { ACCENT } else { TEXT });
-            if score > 0.0 {
-                let info = format!("{score:.3}");
-                text(ctx, x + 260, cy, &info, 13, FW_NORMAL, MUTED);
-            }
-            let path = ctx.ui.catalog.entry_path(doc).to_string();
-            let cut: String = path.chars().rev().take(64).collect::<Vec<_>>().into_iter().rev().collect();
-            text(ctx, x + 340, cy, &("…".to_string() + &cut), 13, FW_NORMAL, MUTED);
-        }
-        if count == 0 {
-            text(ctx, x + 20, list_top + 8, "пусто — поиск по Enter или клик по каталогу в «Каталоге»", 13, FW_NORMAL, MUTED);
-        }
-    }
-
-    // ---- Статистика
-    tile(ctx, &r_stats);
-    ctx.ui.r_stats = r_stats.xywh();
-    {
-        let (x, y, _, _) = r_stats.xywh();
-        let lines = [
-            format!("каталогов   {}", ctx.ui.stats.dirs),
-            format!("записей PDF {}", ctx.ui.stats.files),
-            format!("ошибок      {}", ctx.ui.stats.errors),
-            format!("индекс      {}", if ctx.ui.index_loaded { "есть" } else { "нет" }),
-        ];
-        let mut cy = y + 42;
-        for l in &lines {
-            text(ctx, x + 14, cy, l, 13, FW_NORMAL, MUTED);
-            cy += 24;
-        }
-        let mut cy2 = y + 42 + 24 * 4;
-        let db_str: String = ctx.ui.db.display().to_string().chars().take(26).collect();
-        text(ctx, x + 14, cy2, &db_str, 13, FW_NORMAL, 0x5B6878);
-        let _ = cy2;
-    }
-
-    // ---- Превью: рендер страницы PDF
+    // ---- Превью (главная область)
     tile(ctx, &r_preview);
     ctx.ui.r_preview = r_preview.xywh();
     {
         let (x, y, wid, hei) = r_preview.xywh();
-        let pv_page = ctx.ui.pv_page;
-        let pv_zoom = ctx.ui.pv_zoom;
-        let pv_offx = ctx.ui.pv_offx;
-        let pv_offy = ctx.ui.pv_offy;
-        let pv_page_count = ctx.ui.pv.as_ref().map(|p| p.pages()).unwrap_or(0);
-        // Кнопки навигации (до заёма pv)
+        // Кнопки навигации страниц
         let by = y + 30;
-        let btn = |bx: i32| (bx, by, 32, 26);
-        let b_prev = btn(x + wid - 150);
-        let b_next = btn(x + wid - 110);
+        let b_prev = (x + wid - 150, by, 32, 26);
+        let b_next = (x + wid - 110, by, 32, 26);
         ctx.ui.pv_btn_prev = b_prev;
         ctx.ui.pv_btn_next = b_next;
         fill(ctx, b_prev.0, b_prev.1, b_prev.2, b_prev.3, TILE);
@@ -741,10 +643,10 @@ pub fn draw_frame(ctx: &mut Ctx) {
         let mut pv = ctx.ui.pv.take();
         match pv.as_mut() {
             None => {
-                text(ctx, x + 14, y + 34, "выберите PDF в «Каталоге» или «Результатах»", 13, FW_NORMAL, MUTED);
+                text(ctx, x + 20, y + 90, "выберите PDF в «Каталоге» или «Результатах»", 13, FW_NORMAL, MUTED);
+                text(ctx, x + 20, y + 112, "или нажмите «Сканировать…»", 13, FW_NORMAL, MUTED);
             }
             Some(pv) => {
-                // Канвас
                 let cx = x + 8;
                 let cy = y + 62;
                 let cw = wid - 16;
@@ -771,6 +673,79 @@ pub fn draw_frame(ctx: &mut Ctx) {
         }
         ctx.ui.pv = pv;
         ctx.ui.pv_offy = pv_offy;
+    }
+
+    // ---- Сайдбар: поиск
+    tile(ctx, &r_search);
+    ctx.ui.r_search = r_search.xywh();
+    {
+        let (sx, sy, sw2, sh) = r_search.xywh();
+        let ih = 32;
+        fill(ctx, sx + 12, sy + 30, sw2 - 24, ih, HOVER);
+        fill(ctx, sx + 12, sy + 30, 1, ih, BORDER);
+        fill(ctx, sx + sw2 - 13, sy + 30, 1, ih, BORDER);
+        let q = ctx.ui.query.clone();
+        let cx = text(ctx, sx + 20, sy + 34, &q, 15, FW_NORMAL, TEXT);
+        if q.is_empty() {
+            text(ctx, sx + 20, sy + 34, "поиск по имени и тексту — Enter…", 15, FW_NORMAL, 0x5B6878);
+        }
+        if ctx.ui.focus == Focus::Search && ctx.caret_visible {
+            fill(ctx, sx + 20 + cx, sy + 34, 2, 18, ACCENT);
+        }
+    }
+
+    // ---- Сайдбар: результаты
+    tile(ctx, &r_results);
+    ctx.ui.r_results = r_results.xywh();
+    {
+        let (x, y, wid, hei) = r_results.xywh();
+        let row_h = 24;
+        let list_top = y + 30;
+        let max_rows = ((hei - 40) / row_h + 1) as i32;
+        let base = (ctx.ui.scroll_results / row_h) as usize;
+        let count = ctx.ui.results.len();
+        for (i, &(doc, score)) in ctx.ui.results.iter().enumerate().skip(base).take(max_rows as usize) {
+            let cy = list_top + (i as i32) * row_h - ctx.ui.scroll_results;
+            if cy < list_top - row_h || cy > y + hei - 8 {
+                continue;
+            }
+            let selected = ctx.ui.selected == Some(doc);
+            if selected {
+                fill(ctx, x + 8, cy - 2, wid - 16, row_h, HOVER);
+            }
+            let name = ctx.ui.catalog.entry_name(doc).to_string();
+            let cut: String = name.chars().take(30).collect();
+            text(ctx, x + 14, cy, &cut, 13, FW_SEMIBOLD, if selected { ACCENT } else { TEXT });
+        }
+        if count == 0 {
+            text(ctx, x + 14, list_top + 6, "пусто", 13, FW_NORMAL, MUTED);
+        }
+    }
+
+    // ---- Сайдбар: каталог
+    tile(ctx, &r_tree);
+    ctx.ui.r_tree = r_tree.xywh();
+    match ctx.ui.mode {
+        Mode::Tree => draw_tree(ctx, &r_tree),
+        Mode::Graph => draw_graph(ctx, &r_tree),
+    }
+
+    // ---- Сайдбар: статистика
+    tile(ctx, &r_stats);
+    ctx.ui.r_stats = r_stats.xywh();
+    {
+        let (x, y, _, _) = r_stats.xywh();
+        let lines = [
+            format!("каталогов   {}", ctx.ui.stats.dirs),
+            format!("записей PDF {}", ctx.ui.stats.files),
+            format!("ошибок      {}", ctx.ui.stats.errors),
+            format!("индекс      {}", if ctx.ui.index_loaded { "есть" } else { "нет" }),
+        ];
+        let mut cy = y + 36;
+        for l in &lines {
+            text(ctx, x + 14, cy, l, 13, FW_NORMAL, MUTED);
+            cy += 24;
+        }
     }
 
     // ---- Статусная строка
@@ -848,7 +823,7 @@ fn draw_tree(ctx: &mut Ctx, t: &Tile) {
         match item {
             TreeItem::Dir { depth, name, .. } => {
                 let x = t.x + 14 + (*depth as i32) * 16;
-                let cut: String = name.chars().take(56).collect();
+                let cut: String = name.chars().take((t.w as usize) / 6).collect();
                 text(ctx, x, cy, &cut, 13, FW_SEMIBOLD, MUTED);
             }
             TreeItem::File { doc_id, depth, name } => {
@@ -857,7 +832,7 @@ fn draw_tree(ctx: &mut Ctx, t: &Tile) {
                 if selected {
                     fill(ctx, t.x + 8, cy - 2, t.w - 16, row_h, HOVER);
                 }
-                let cut: String = name.chars().take(52).collect();
+                let cut: String = name.chars().take((t.w as usize) / 6 - 2).collect();
                 text(ctx, x, cy, &cut, 13, FW_NORMAL, if selected { ACCENT } else { TEXT });
             }
         }

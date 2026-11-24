@@ -17,3 +17,17 @@ views, Cyrillic BM25 search, DB next to the exe, read-only drive.
 
 Honest renderer limits: no images (DCT/CCITT), no shadings, no clip paths, no embedded fonts
 (substituted with system Segoe UI). Tests 18/18. Win7: `pdfcat-0.3.0-win7-x64.exe` (595 KB).
+## v0.4.0 — превью-основа экрана, JPEG, автоматизация горячих путей
+
+- JPEG-DHT: счётчики кодов по длинам интерпретировались как per-symbol длины → новый `build_huff_from_counts`.
+- IDCT: двойной level shift (+128 в IDCT и при записи в план) — убран из IDCT.
+- `stream_of`: DCTDecode — терминальный фильтр, байты проходят сырыми (раньше Unsupported).
+- Композиция матриц: `cm`/`Td`/`TD`/`T*` — `st.ctm.mul(&m)` (column-vector), `Tm` — замена.
+- UI: превью — главная область; сайдбар 340 px (поиск/результаты/каталог/статистика).
+- Фон-поток: `pipeline::scan_and_index` в `std::thread::spawn`, прогресс `Arc<Mutex<String>>`,
+  перезагрузка каталога/индекса по флагу `reload_requested` в таймере (200 мс).
+- Параллельная индексация: чанки по 8 потокам, локальные doc_id, слияние `Bm25::merge_chunk(part, offset)`.
+  Ошибки суммируются по чанкам; join обязателен (регрессия: результаты дропались).
+- Горячие пути (замеры): скан 360 файлов — 7–37 мс; индекс 120 PDF — 51–819 мс (холодный/тёплый);
+  BM25-запрос — 59–72 мкс; SIMD AVX2/SSE2 в ядре BM25 (без изменений).
+

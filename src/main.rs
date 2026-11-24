@@ -7,7 +7,9 @@ mod cli;
 mod domain;
 mod index_store;
 mod inflate;
+mod jpeg;
 mod pdf;
+mod pipeline;
 mod ports;
 mod render_pdf;
 mod scan;
@@ -20,7 +22,6 @@ fn main() {
     let code = match args.get(1).map(|s| s.as_str()) {
         None => win::run_gui(),
         Some("snapshot") => {
-            // snapshot <out.bmp> [w h] — оффscreen-рендер UI для проверки без окна
             let out = args.get(2).cloned().unwrap_or_else(|| "snapshot.bmp".into());
             let w = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1440);
             let h = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(900);
@@ -40,9 +41,8 @@ fn main() {
         }
         Some("scan") if args.len() >= 3 => {
             let depth = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
-            cli::cmd_scan(&args[2], depth)
+            cli::cmd_scan_index(&args[2], depth)
         }
-        Some("index") => cli::cmd_index(args.get(2).and_then(|s| s.parse().ok())),
         Some("search") if args.len() >= 3 => {
             let limit = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
             cli::cmd_search(&args[2], limit)

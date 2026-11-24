@@ -6,6 +6,8 @@
 
 use crate::pdf::{page_fonts, FontMap, PdfDoc, Value};
 use crate::win::*;
+use std::ffi::c_void;
+use crate::win::*;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,6 +61,8 @@ pub struct PdfRender {
     pages: Vec<(u32, (f64, f64, f64, f64))>,
     _page: usize,
     _offy: f64,
+    /// Декодированные картинки: objnum -> (w, h, rgb)
+    images: std::cell::RefCell<std::collections::HashMap<u32, (usize, usize, Vec<u8>)>>,
 }
 
 impl PdfRender {
@@ -109,7 +113,7 @@ impl PdfRender {
                 }
             }
         }
-        Ok(Self { doc, pages, _page: 0, _offy: 0.0 })
+        Ok(Self { doc, pages, _page: 0, _offy: 0.0, images: std::cell::RefCell::new(HashMap::new()) })
     }
 
     pub fn pages(&self) -> usize {
@@ -140,6 +144,9 @@ impl PdfRender {
     /// Рендер страницы прямо в контекст окна: страница -> прямоугольник dst.
     /// zoom — пикселей на пункт; offx/offy — прокрутка в пикселях.
     pub fn render_page_into(&self, hdc: HDC, dst: (i32, i32, i32, i32), page: usize, zoom: f64, offx: f64, offy: f64) { unsafe {
+        if std::env::var("JPEG_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[rp] page={page} pages={} dst={dst:?}", self.pages.len());
+        }
         let Some((obj, mb)) = self.pages.get(page.min(self.pages.len().saturating_sub(1))).copied() else {
             return;
         };
@@ -163,6 +170,9 @@ impl PdfRender {
             }
             _ => Vec::new(),
         };
+        if std::env::var("JPEG_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[content] len={}", content.len());
+        }
         if content.is_empty() {
             return;
         }
@@ -180,6 +190,7 @@ impl PdfRender {
             eprintln!("[page] dst={dst:?} zoom={zoom} offy={offy} mb={mb:?} base=({:.2},{:.2},{:.2},{:.2},{:.2},{:.2})", base.a, base.b, base.c, base.d, base.e, base.f);
         }
         let fonts = page_fonts(&self.doc, obj);
+        let resources = d.get(&b"Resources".to_vec()).cloned().unwrap_or(Value::Null);
         // Клип по листу (MediaBox): строки не вылезают за страницу
         let pr1 = base.apply(mb.0, mb.1);
         let pr2 = base.apply(mb.2, mb.3);
@@ -319,7 +330,8 @@ impl PdfRender {
                 }
                 b"cm" if nums.len() == 6 => {
                     let m = Mat { a: nums[0], b: nums[1], c: nums[2], d: nums[3], e: nums[4], f: nums[5] };
-                    st.ctm = m.mul(&st.ctm);
+                    // column-vector: новая карта = старая ∘ cm, т.е. (old×m)(p) = old(m(p))
+                    st.ctm = st.ctm.mul(&m);
                 }
                 b"w" if !nums.is_empty() => st.line_w = nums[nums.len() - 1],
                 b"rg" if nums.len() == 3 => st.fill = rgb01(nums[0], nums[1], nums[2]),
@@ -343,6 +355,11 @@ impl PdfRender {
                 b"l" if nums.len() == 2 => {}
                 b"c" if nums.len() == 6 => {}
                 b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"b" | b"n" => {}
+                b"Do" => {
+                    if let Some(name) = name_tok.take() {
+                        draw_xobject(hdc, &self.doc, &self.images, &name, st.ctm, &resources);
+                    }
+                }
                 b"BT" => {
                     in_text = true;
                     tm = Mat::id();
@@ -359,13 +376,13 @@ impl PdfRender {
                 }
                 b"Td" if nums.len() == 2 => {
                     let t = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: nums[0], f: nums[1] };
-                    tm = t.mul(&tm);
+                    tm = tm.mul(&t);
                     tl = 1.2 * font_size;
                 }
                 b"TD" if nums.len() == 2 => {
                     tl = -nums[1];
                     let t = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: nums[0], f: nums[1] };
-                    tm = t.mul(&tm);
+                    tm = tm.mul(&t);
                 }
                 b"Tm" if nums.len() == 6 => {
                     tm = Mat { a: nums[0], b: nums[1], c: nums[2], d: nums[3], e: nums[4], f: nums[5] };
@@ -373,7 +390,7 @@ impl PdfRender {
                 }
                 b"T*" => {
                     let t = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: -tl };
-                    tm = t.mul(&tm);
+                    tm = tm.mul(&t);
                 }
                 b"Tj" => {
                     if in_text {
@@ -387,7 +404,7 @@ impl PdfRender {
                 b"'" => {
                     if in_text {
                         let t = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: -tl };
-                        tm = t.mul(&tm);
+                        tm = tm.mul(&t);
                         if let Some(sb) = &cur_str {
                             let fi: Option<&FontMap> = fonts.get(&font_name);
                             draw_text_op(hdc, sb, &font_name, fi, tm, st, font_size);
@@ -398,7 +415,7 @@ impl PdfRender {
                 b"\"" => {
                     if in_text {
                         let t = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: -tl };
-                        tm = t.mul(&tm);
+                        tm = tm.mul(&t);
                         if let Some(sb) = &cur_str {
                             let fi: Option<&FontMap> = fonts.get(&font_name);
                             draw_text_op(hdc, sb, &font_name, fi, tm, st, font_size);
@@ -416,6 +433,104 @@ impl PdfRender {
         RestoreDC(hdc, -saved);
     }
 }
+}
+
+/// Отрисовка XObject-картинки: rect = единичный квадрат через CTM.
+/// Поддержано: /Subtype /Image, /Filter /DCTDecode (свой JPEG), 8 бит; RGB/Gray.
+fn draw_xobject(
+    hdc: HDC, doc: &PdfDoc, images: &std::cell::RefCell<std::collections::HashMap<u32, (usize, usize, Vec<u8>)>>,
+    name: &[u8], ctm: Mat, resources: &Value,
+) {
+    if std::env::var("JPEG_DEBUG").as_deref() == Ok("1") {
+        eprintln!("[xobj] вход name={name:?} res={resources:?}");
+    }
+    let res_dict: Option<HashMap<Vec<u8>, Value>> = match resources {
+        Value::Dict(d) => Some(d.clone()),
+        Value::Ref(n, _) => doc.obj_dict(*n),
+        _ => None,
+    };
+    let Some(rd) = res_dict else { return };
+    let Some(xobjs) = rd.get(&b"XObject".to_vec()) else { return };
+    let xo_dict: Option<HashMap<Vec<u8>, Value>> = match xobjs {
+        Value::Dict(d) => Some(d.clone()),
+        Value::Ref(n, _) => doc.obj_dict(*n),
+        _ => None,
+    };
+    let Some(xd) = xo_dict else { return };
+    let Some(Value::Ref(obj, _)) = xd.get(name) else { return };
+    let Some(xdict) = doc.obj_dict(*obj) else { return };
+    let is_image = matches!(xdict.get(&b"Subtype".to_vec()), Some(Value::Name(n)) if n == b"Image");
+    if std::env::var("JPEG_DEBUG").as_deref() == Ok("1") {
+        eprintln!("[xobj] subtype: {:?}", xdict.get(&b"Subtype".to_vec()));
+        eprintln!("[xobj] width: {:?}", xdict.get(&b"Width".to_vec()));
+    }
+    if !is_image {
+        return;
+    }
+    let w = match xdict.get(&b"Width".to_vec()) {
+        Some(Value::Num(v)) => *v as usize,
+        _ => return,
+    };
+    let hgt = match xdict.get(&b"Height".to_vec()) {
+        Some(Value::Num(v)) => *v as usize,
+        _ => return,
+    };
+    if w == 0 || hgt == 0 || w * hgt > 64 * 1024 * 1024 {
+        return;
+    }
+    let mut cache = images.borrow_mut();
+    let (iw, ih, rgb) = cache.entry(*obj).or_insert_with(|| {
+        let raw = doc.stream_of(*obj).ok().flatten().unwrap_or_default();
+        if std::env::var("JPEG_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[xobj] raw={}", raw.len());
+        }
+        let rgb = match xdict.get(&b"Filter".to_vec()) {
+            Some(Value::Name(n)) if n == b"DCTDecode" => crate::jpeg::decode_jpeg(&raw)
+                .map(|(_, _, rgb)| rgb)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        (w, hgt, rgb)
+    })
+    .clone();
+    if rgb.is_empty() {
+        return;
+    }
+    let p00 = ctm.apply(0.0, 0.0);
+    let p11 = ctm.apply(1.0, 1.0);
+    if std::env::var("JPEG_DEBUG").as_deref() == Ok("1") {
+        eprintln!("[xobj] {name:?} iw={iw} ih={ih} rgb={} p00={p00:?} p11={p11:?}", rgb.len());
+    }
+    let (l, t, r, b) = rect_norm(p00, p11);
+    let (dw, dh) = ((r - l) as i32, (b - t) as i32);
+    if dw <= 0 || dh <= 0 {
+        return;
+    }
+    let mut bmi = BitmapInfoHeader::default();
+    bmi.bi_size = 40;
+    bmi.bi_width = iw as i32;
+    bmi.bi_height = ih as i32;
+    bmi.bi_planes = 1;
+    bmi.bi_bit_count = 24;
+    bmi.bi_compression = 0;
+    let row_b = ((iw * 3 + 3) / 4) * 4;
+    let mut bits = vec![0u8; row_b * ih];
+    for y in 0..ih {
+        let src_y = ih - 1 - y;
+        for x in 0..iw {
+            let o_src = (src_y * iw + x) * 3;
+            let o = y * row_b + x * 3;
+            bits[o] = rgb[o_src + 2];
+            bits[o + 1] = rgb[o_src + 1];
+            bits[o + 2] = rgb[o_src];
+        }
+    }
+    unsafe {
+        StretchDIBits(
+            hdc, l as i32, t as i32, dw, dh, 0, 0, iw as i32, ih as i32,
+            bits.as_ptr() as *const std::ffi::c_void, &bmi, 0, SRCCOPY,
+        );
+    }
 }
 
 fn rect_norm(p1: (f64, f64), p2: (f64, f64)) -> (f64, f64, f64, f64) {
@@ -652,6 +767,38 @@ mod tests {
             DeleteObject(bmp);
             DeleteDC(mem);
             assert!(dark >= 100, "тёмных пикселей: {dark} — текст не отрисован");
+        }
+    }
+}
+
+#[cfg(test)]
+mod img_tests {
+    use super::*;
+
+    /// Рендер страницы с JPEG-картинкой: красный квадрат должен дать красные пиксели.
+    #[test]
+    fn render_img_has_red() {
+        let r = PdfRender::open("tests/fixtures/img_page.pdf").unwrap();
+        unsafe {
+            let mem = CreateCompatibleDC(0);
+            let mut bmi = BitmapInfoHeader::default();
+            bmi.bi_size = 40;
+            bmi.bi_width = 300;
+            bmi.bi_height = -200;
+            bmi.bi_planes = 1;
+            bmi.bi_bit_count = 32;
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(mem, &bmi, 0, &mut bits, 0, 0);
+            SelectObject(mem, bmp);
+            let sl = std::slice::from_raw_parts_mut(bits as *mut u32, 300 * 200);
+            sl.fill(0x00FFFFFF);
+            r.render_page_into(mem, (0, 0, 300, 200), 0, 1.0, 0.0, 0.0);
+            // DIB 32bpp: байты BGX в u32 (LE): 0x00BBGGRR
+            // DIB 32bpp LE: байт0=B, байт1=G, байт2=R → R=(p>>16)
+            let red = sl.iter().filter(|&&p| ((p >> 16) & 0xFF) > 140 && ((p >> 8) & 0xFF) < 110 && (p & 0xFF) < 110).count();
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            assert!(red > 500, "красных пикселей: {red} — JPEG-картинка не отрисована");
         }
     }
 }

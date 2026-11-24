@@ -80,6 +80,19 @@ impl Bm25 {
         scores
     }
 
+    /// Слияние чанка: doc_id сдвигается на offset (чанки не пересекаются).
+    pub fn merge_chunk(&mut self, other: Bm25, offset: u32) {
+        for (term, posts) in other.postings {
+            self.postings
+                .entry(term)
+                .or_default()
+                .extend(posts.into_iter().map(|(d, tf)| (d + offset, tf)));
+        }
+        self.doc_len.extend(other.doc_len);
+        self.total_terms += other.total_terms;
+        self.recompute_avgdl();
+    }
+
     pub fn stats(&self) -> (usize, u64) {
         (self.postings.len(), self.total_terms)
     }

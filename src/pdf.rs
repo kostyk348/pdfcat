@@ -483,19 +483,22 @@ impl PdfDoc {
             Some(Value::Name(n)) if n == b"FlateDecode" => zlib_decompress(raw)
                 .map_err(|_| ExtractError::Unsupported("flate"))?,
             Some(Value::Array(items)) => {
+                // Цепочка: FlateDecode может идти до терминального (DCTDecode и др.),
+                // терминальный фильтр оставляет данные как есть (их декодирует consumer).
                 let mut out = raw.to_vec();
                 for it in items {
-                    if let Value::Name(n) = it {
-                        if n == b"FlateDecode" {
+                    match it {
+                        Value::Name(n) if n == b"FlateDecode" => {
                             out = zlib_decompress(&out).map_err(|_| ExtractError::Unsupported("flate"))?;
-                        } else {
-                            return Err(ExtractError::Unsupported("filter"));
                         }
+                        _ => break,
                     }
                 }
                 out
             }
             None => raw.to_vec(),
+            // DCTDecode и другие терминальные — сырые байты (JPEG декодирует render_pdf)
+            Some(Value::Name(_)) => raw.to_vec(),
             Some(_) => return Err(ExtractError::Unsupported("filter")),
         };
         let _ = dict;
