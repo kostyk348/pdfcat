@@ -1,3 +1,13 @@
+## v0.4.1 — иконка приложения
+
+- Иконка (маскот: кото-девочка + PDF-лупа) с прозрачными углами: заливка белого от углов кадра
+  (BFS, порог 235), ореол смягчён; внутренние белые элементы (лицо, PDF) не тронуты.
+- Многосайзовый `assets/pdfcat.ico`: 16/24/32/48/64/128 (BMP DIB 32bpp) + 256 (PNG-сжатая запись).
+- Вшита без зависимостей: `build.rs` вызывает `windres assets/resource.rc -O coff`,
+  объект линкуется `cargo:rustc-link-arg-bins` (windres из Mingw-w64; нет — предупреждение).
+- Окно: `LoadImageW(hinst, MAKEINTRESOURCE(1), IMAGE_ICON, LR_DEFAULTSIZE)` в WndClassW.
+- README: иконка в шапке.
+
 # pdfcat v0.3.0 — визуальный превью PDF с пролистыванием
 
 ## Русский

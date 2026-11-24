@@ -127,6 +127,7 @@ pub struct BrowseInfoW {
 
 #[link(name = "user32")]
 extern "system" {
+    pub fn LoadImageW(hinst: isize, name: *const u16, typ: u32, cx: i32, cy: i32, load: u32) -> isize;
     pub fn RegisterClassW(pc: *const WndClassW) -> u16;
     pub fn CreateWindowExW(
         ex: u32, class: *const u16, title: *const u16, style: u32,
@@ -558,7 +559,8 @@ pub fn run_gui() -> i32 {
             cb_cls_extra: 0,
             cb_wnd_extra: 0,
             h_instance: hinst,
-            h_icon: 0,
+            // иконка из ресурса exe (1 ICON в resource.rc); fallback — стандартная
+            h_icon: LoadImageW(hinst, 1 as _, 1, 0, 0, 0x00000010) as _,
             h_cursor: LoadCursorW(0, IDC_ARROW),
             h_br_background: 0,
             lpsz_menu_name: std::ptr::null(),
